@@ -5746,12 +5746,63 @@ var ALIGN = {
             '<div class="sec-title" style="margin-top:12px">原始数据（可复制到剪贴板）</div>' +
             '<textarea id="diagTxt" class="inp" rows="8" style="width:100%;font-family:monospace;font-size:12px">' +
             esc(txt.join('\n')) + '</textarea>' +
-            '<p class="hint">判断依据：官方只承诺「已认证 = <b>5000</b>/小时」。<br>' +
+            /* 关键补充：用户真正该关心的不是「为什么不是 5000」，而是「够不够用」。
+             * 根据实测，改动才会真正计费（一次改动 ≈ 1 PATCH + 其余设备各 1 次 200），
+             * 而没人改动时几乎全是 304 —— 已认证的 304 不计额度。
+             * 所以这里直接按当前配置估算，给出够/不够的结论，比纠结数字有用。 */
+            (function () {
+              var core = (res.core && res.core.limit) ? res.core.limit : 0;
+              var devs = Math.max(1, parseInt(db.settings.deviceCount, 10) || 1);
+              var sec = Math.max(10, parseInt(db.settings.autoSync, 10) || 20);
+              /* 估算模型（按实测行为）：
+               * 每台每小时最多发出 3600/间隔 次轮询；已认证的 304 不计额度，
+               * 所以「没人改动」时几乎免费，「每次都撞上改动」是最坏情况。
+               * 这里给出上下限两档，而不是编一个中间的假数字。 */
+              var perHourEach = Math.round(3600 / sec);
+              var maxPerHour = perHourEach * devs;   // 最坏：每次都计
+              var freePerHour = 0;                   // 最好：全 304，不计费
+              var need = Math.max(60, Math.round(3600 * devs / Math.max(1, core)));
+              var out = '<div class="sec-title" style="margin-top:12px">这个额度够你用吗</div>' +
+                '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+                '<tr><td>设备数（设置里填的）</td><td><b>' + devs + '</b> 台</td></tr>' +
+                '<tr><td>自动同步间隔</td><td><b>' + sec + '</b> 秒</td></tr>' +
+                '<tr><td>每小时最多发出</td><td><b>' + maxPerHour + '</b> 次</td></tr>' +
+                '<tr><td>其中没人改动时（304 免费）</td><td>约 <b>' + freePerHour +
+                '</b> 次计费</td></tr>' +
+                '<tr><td>最坏情况（每次都撞上改动）</td><td>最多 <b>' + maxPerHour +
+                '</b> 次计费</td></tr>' +
+                '<tr><td>当前上限</td><td><b>' + core + '</b> 次/小时</td></tr>' +
+                '</table><p class="hint">';
+              if (core >= maxPerHour) {
+                out += '✅ <b>肯定够</b>。即便每小时每一轮都计费也用不完。<br>' +
+                  '上限低不影响实际使用 —— 真正决定消耗的是<b>改动频率</b>，不是设备数。';
+              } else if (core >= maxPerHour * 0.2) {
+                out += '✅ <b>基本够用</b>。虽然上限低于「每小时最多发出」，' +
+                  '但没人改动时几乎全是 304（<b>已认证的 304 不计额度</b>），' +
+                  '只有真有改动的那几轮才计费。<br>' +
+                  '想更保险：把间隔调到 <b>' + Math.min(600, need) + '</b> 秒。';
+              } else {
+                out += '⚠ <b>偏紧</b>。上限相对你的轮询频率低不少，' +
+                  '密集改动时容易见底。<br>' +
+                  '建议：把间隔调到 <b>' + Math.min(600, Math.max(120, need)) +
+                  '</b> 秒以上，或减少开云同步的设备数。<br>' +
+                  '（改动才是主要消耗：一次改动 ≈ 1 次上传 + 其余设备各 1 次下载。）';
+              }
+              out += '</p>';
+              return out;
+            })() +
+            '<div class="sec-title" style="margin-top:12px">判断依据</div>' +
+            '<p class="hint">官方只承诺「已认证 = <b>5000</b>/小时」。<br>' +
             '· core 上限 <b>5000</b> → 正常<br>' +
             '· core 上限 <b>60</b> → 令牌没生效，按匿名算<br>' +
-            '· core 上限 <b>低于 5000</b>（如 100）→ 不在公开档位表内，' +
-            '多为账号近期请求过猛被临时降额，或账号/组织有额外策略。<br>' +
-            '对照上面的「响应头」和「令牌类型」一起看，最准。</p></div>';
+            '· core 上限 <b>低于 5000</b>（如 100）→ 不在公开档位表内，属未公开降额。<br><br>' +
+            '<b>关于「换了新账号 / 新仓库还是 100」：</b><br>' +
+            '· <b>新仓库不影响额度</b>。Pages 仓库和 Gist API 是两套东西，' +
+            '换仓库、重建站点都不会改变额度。<br>' +
+            '· 这类降额<b>不完全按账号算，也看请求来源 IP 和请求模式</b>。' +
+            '同一个网络、同样多台设备高频轮询，换个新号照样会被压。<br>' +
+            '· <b>想验证是不是 IP 维度</b>：用手机开热点让电脑连上（换成移动网络），' +
+            '再点一次本诊断。如果上限变回 5000，就坐实是网络侧判定。</p></div>';
           openModal('额度诊断', html, [
             { text: '复制', cls: 'btn', fn: function () {
                 var ta = $('#diagTxt');
