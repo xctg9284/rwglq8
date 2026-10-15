@@ -2829,16 +2829,26 @@ var ALIGN = {
     order.forEach(function (k) {
       var g = groups[k];
       if (g.length === 1) { out.push(g[0]); return; }
+      /* 选留哪一份：先看「有没有 pid」，再看体积。
+       * 只按体积挑是不够的 —— 体积最小的那一份可能正是被清掉标记的旧副本，
+       * 留下它会导致 pid 再次丢失，下次同步又翻倍，陷入循环。 */
       var best = g[0], bl = String(g[0].data || '').length;
       g.forEach(function (p) {
         var len = String(p.data || '').length;
-        if (len < bl) { best = p; bl = len; }
+        var better = false;
+        if (!best.pid && p.pid) better = true;                  // 有 pid 的优先
+        else if (!!best.pid === !!p.pid) better = (len < bl);   // 否则取更小的
+        if (better) { best = p; bl = len; }
       });
       // 保留压缩档位标记：任一版本压过就算压过，避免下次又被压一遍
       var pq = null;
       g.forEach(function (p) { if (p.pq) { if (!pq || PHOTO_ORDER[p.pq] < PHOTO_ORDER[pq]) pq = p.pq; } });
       var o = Object.assign({}, best);
       if (pq) o.pq = pq;
+      /* 标识兜底：留下的这份若缺 pid / 原始尺寸，从同组其它副本里补。
+       * 宁可沿用已有的稳定标识，也不要重新生成一个新的（会再次分裂）。 */
+      if (!o.pid) { g.forEach(function (p) { if (!o.pid && p.pid) o.pid = p.pid; }); }
+      if (!o.ow || !o.oh) { g.forEach(function (p) { if ((!o.ow || !o.oh) && p.ow && p.oh) { o.ow = p.ow; o.oh = p.oh; } }); }
       out.push(o);
     });
     return out;
@@ -3086,11 +3096,23 @@ var ALIGN = {
              * （极端情况：纯噪点图缩放后差异会偏大，但真实照片不会。） */
             if (hashDist(hs[i], hs[seen[j]]) <= 10) {
               dup = true;
-              /* 保留体积更小的那份（通常是压过的） */
-              if (String(p.data || '').length < String(r.photos[seen[j]].data || '').length) {
-                keep[keep.length - 1] = p;
-                seen[seen.length - 1] = i;
+              var cur = keep[j];
+              /* 【关键】不能只按体积挑：体积最小的那份往往正是丢了标识的旧副本，
+               * 留下它会让 pid / pq 再次丢失，于是下次同步又分裂成两份，陷入循环。
+               * 先比「有没有标识」，再比体积。 */
+              var win = p, lose = cur;
+              if (cur.pid && !p.pid) { win = cur; lose = p; }
+              else if (!!cur.pid === !!p.pid &&
+                       String(p.data || '').length >= String(cur.data || '').length) {
+                win = cur; lose = p;
               }
+              /* 标识兜底：赢家若缺 pid / 原始尺寸，从输家身上补过来，
+               * 绝不重新生成一个新的（那会再次分裂）。 */
+              if (!win.pid && lose.pid) win.pid = lose.pid;
+              if ((!win.ow || !win.oh) && lose.ow && lose.oh) { win.ow = lose.ow; win.oh = lose.oh; }
+              if (!win.pq && lose.pq) win.pq = lose.pq;
+              keep[j] = win;
+              seen[j] = i;
               break;
             }
           }
@@ -5066,8 +5088,18 @@ var ALIGN = {
       '</div>';
 
     // 打开表单时，先把已有图片拷进临时数组；取消或关闭不会污染原记录
+    /* 【关键】这四个字段必须原样带出来，丢了就会连锁引发严重问题：
+     *   pq  —— 压缩档位标记。丢了 → 这张图又被判定成「没压过」，
+     *          于是每次编辑完都冒出「1 张要压缩」，反复重压画质越来越糊。
+     *   pid —— 跨设备判重标识。丢了 → 同步时认不出是同一张图，
+     *          本机一份 + 云端一份合并成两份，图片翻倍、数据膨胀，
+     *          最终超出 Gist 1MB 读取上限 → 同步截断、档案看起来损坏。
+     *   ow/oh —— 原始尺寸，pid 的派生依据之一。丢了 → 各设备算出的 pid 不同。
+     * 之前这里只拷了 data/w/h/name/size，正是「编辑一次就出问题」的根因。 */
     formPhotos = (r && Array.isArray(r.photos)) ? r.photos.map(function (p) {
-      return { data: p.data, w: p.w, h: p.h, name: p.name || '', size: p.size || 0 };
+      return { data: p.data, w: p.w, h: p.h, ow: p.ow, oh: p.oh,
+               name: p.name || '', size: p.size || 0,
+               pq: p.pq || '', pid: p.pid || '' };
     }) : [];
 
     openModal(r ? '编辑档案' : '新建档案', html, [
@@ -5082,6 +5114,17 @@ var ALIGN = {
           photos: formPhotos.slice(),
           operator: db.settings.operator || '系统'
         };
+        /* 保存前兜底：万一 formPhotos 里有的图缺标识（旧数据、链接导入等），
+         * 在这里补齐，避免一同步就在别台设备翻倍。 */
+        data.photos = (data.photos || []).map(function (p) {
+          if (!p) return p;
+          if (!p.ow || !p.oh) { p.ow = p.w || 0; p.oh = p.h || 0; }
+          if (!p.pid) p.pid = pidFromPhoto(p);
+          if (!p.pq) p.pq = '';
+          return p;
+        });
+        /* 保存前顺手去重：同一张图不会因为反复编辑被复制出多份。 */
+        data.photos = dedupePhotoList(data.photos).slice(0, PHOTO_MAX_COUNT);
         if (!data.title) { toast('请填写档案名称', true); return; }
         if (data.code && db.records.some(function (x) { return x.code === data.code && (!r || x.id !== r.id); })) {
           toast('档案编号已存在：' + data.code, true); return;
@@ -7599,6 +7642,48 @@ var ALIGN = {
         setTimeout(function () { openHelp('wx'); }, 400);
       }
     }
+
+    /* 启动时自动修复图片标识（针对旧版本已经产生的问题数据）。
+     * 历史上「编辑档案」会把 pq / pid / ow / oh 四个字段弄丢，
+     * 后果是：每次编辑都冒出「1 张要压缩」，且同步时认不出同一张图而翻倍，
+     * 图片越滚越多 → 数据膨胀 → 超过 Gist 上限 → 同步截断、档案看起来损坏。
+     * 这里做两件事：
+     *   ① 补齐标识（纯补字段，不删任何东西，绝对安全）
+     *   ② 合并确实重复的副本（按 pid 或 文件名+原始尺寸 判定，保留有标识的那份）
+     * 合并会减少图片张数，所以用 toast 明说，而不是悄悄改掉数据。 */
+    (function repairPhotos() {
+      try {
+        var fixedIds = 0, touched = false;
+        (db.records || []).forEach(function (r) {
+          if (!r || !r.photos || !r.photos.length) return;
+          r.photos.forEach(function (p) {
+            if (!p || !p.data) return;
+            if (!p.ow || !p.oh) { p.ow = p.w || 0; p.oh = p.h || 0; fixedIds++; touched = true; }
+            if (!p.pid) { p.pid = pidFromPhoto(p); fixedIds++; touched = true; }
+          });
+        });
+        if (touched) save();
+        /* 第二步：合并已经产生的重复副本。
+         * 用 dedupePhotosNow —— 它除了按标识判重，还会用画面内容（感知哈希）
+         * 兜底比对，专门收拾「标识丢了、尺寸也被压得不一样」的顽固重复，
+         * 这类只按标识是认不出来的。它是异步的，放在启动流程里不阻塞渲染。 */
+        var hasMulti = (db.records || []).some(function (r) {
+          return r && r.photos && r.photos.length >= 2;
+        });
+        if (hasMulti) {
+          dedupePhotosNow().then(function (res) {
+            if (res && res.removed > 0) {
+              renderAll();
+              refreshShrinkBtn();
+              setTimeout(function () {
+                toast('已自动合并 ' + res.removed +
+                  ' 张重复图片（旧版本遗留），数据变小了，同步不会再被撑爆', true);
+              }, 1200);
+            }
+          }).catch(function () {});
+        }
+      } catch (e) {}
+    })();
 
     loadQuota();
     loadPushed();
