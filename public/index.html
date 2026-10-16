@@ -2760,7 +2760,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.16-b8';
+  var APP_VERSION = '2026.10.16-b9';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -4794,10 +4794,17 @@ var ALIGN = {
           : normaliseRemote(remote);
         // 远端设置比本地新就采用：这样一台设备改了配置，其它设备同步后跟着变
         var remoteSetChanged = false;
+        /* 同步也一样：远端设置里不该带凭据（sharedSettings 本来就只导出共享项），
+         * 但云端可能残留着旧版本写的完整 settings，里面若带空的 gistToken/room，
+         * 就会把本机填好的令牌抹掉。这里显式护住这两个键。 */
+        var keepToken = String(db.settings.gistToken || '').trim();
+        var keepRoom = String(db.settings.room || '').trim();
         if (rem.settings && rem.settingsAt > (db.settings.settingsAt || 0)) {
           remoteSetChanged = applySharedSettings(rem.settings);
           if (remoteSetChanged) db.settings.settingsAt = rem.settingsAt;
         }
+        if (keepToken && !String(db.settings.gistToken || '').trim()) db.settings.gistToken = keepToken;
+        if (keepRoom && !String(db.settings.room || '').trim()) db.settings.room = keepRoom;
         var merged = mergeDocs(doc(), rem);
         /* 示例档案不参与云端交互，但不能因为同步就从本机消失——
          * 否则用户刚打开页面、还没同步完，列表里的示例就凭空没了，
@@ -7171,6 +7178,7 @@ var ALIGN = {
       (db.settings.syncOn && db.settings.room && db.settings.provider === 'gist'
         ? '<button class="btn primary" id="bkCloudInt">☁ 验证云端数据完整性</button>' : '') +
       '<button class="btn primary" id="bkSyncLog">📋 同步日志（看真实 HTTP 记录）</button>' +
+      '<button class="btn primary" id="bkTokenChk">🔑 令牌体检（查 401 到底为什么）</button>' +
       (db.settings.syncOn && db.settings.provider === 'gist'
         ? '<button class="btn danger" id="bkRebuild">🚑 重建云端空间（根治截断）</button>' : '') +
       (photoStats().count ? '<button class="btn" id="bkDedupePhoto" style="margin-top:8px">🧹 清理重复图片</button>' : '') +
@@ -7219,6 +7227,8 @@ var ALIGN = {
     if (ci) ci.onclick = function () { closeModal(); setTimeout(openCloudIntegrity, 200); };
     var sl = $('#bkSyncLog');
     if (sl) sl.onclick = function () { closeModal(); setTimeout(openSyncLog, 200); };
+    var tc = $('#bkTokenChk');
+    if (tc) tc.onclick = function () { closeModal(); setTimeout(openTokenCheck, 200); };
     var rb = $('#bkRebuild');
     if (rb) rb.onclick = function () { closeModal(); setTimeout(openRebuild, 200); };
     /* 这个按钮是备份面板里的，面板 HTML 动态生成，
@@ -7250,9 +7260,23 @@ var ALIGN = {
         try { d = JSON.parse(text); } catch (e) { toast('不是有效的备份文件', true); return; }
         var applyImport = function (mode) {
         var beforeN = db.records.length;
+        /* 【凭据不能被导入覆盖 —— 这是「令牌莫名没了」的真凶】
+         * 原来这里是 Object.keys(d.settings).forEach(k => db.settings[k] = d.settings[k])，
+         * 而备份文件里的 settings.gistToken 常常是空的（导出时没填、或那份来自没配过令牌的设备）。
+         * 于是用户刚在 GitHub 上生成好、填进设置的新令牌，
+         * 一导入备份就被覆盖成空字符串 —— 表现就是「令牌被删了」，
+         * 接着所有同步/重建全部 401，而用户完全想不到是导入导致的。
+         *
+         * 令牌和空间地址是「身份凭据」，不是「档案数据」。
+         * 导入档案时不该动它：本机已填的就保留，备份里带来的也不抢。 */
+        var myToken = String(db.settings.gistToken || '').trim();
+        var myRoom = String(db.settings.room || '').trim();
         if (mode === 'replace') {
           db.records = d.records || []; db.logs = d.logs || []; db.deleted = d.deleted || [];
-          Object.keys(d.settings || {}).forEach(function (k) { db.settings[k] = d.settings[k]; });
+          Object.keys(d.settings || {}).forEach(function (k) {
+            if (k === 'gistToken' || k === 'room') return;   // 凭据不动
+            db.settings[k] = d.settings[k];
+          });
         } else {
           var m = mergeDocs(doc(), normaliseRemote(d), { ignoreTombstones: true });
           db.records = m.records; db.logs = m.logs; db.deleted = m.deleted;
@@ -7267,10 +7291,20 @@ var ALIGN = {
             db.settings.levels = mergeLists(db.settings.levels, d.settings.levels);
           }
         }
+        /* 双保险：不管中间经历了什么，导入结束后凭据必须还在。
+         * 只要导入前本机有，导入后就一定还原回去。 */
+        var tokenKept = false;
+        if (myToken && !String(db.settings.gistToken || '').trim()) {
+          db.settings.gistToken = myToken; tokenKept = true;
+        }
+        if (myRoom && !String(db.settings.room || '').trim()) {
+          db.settings.room = myRoom; tokenKept = true;
+        }
         var addedN = db.records.length - beforeN;
         save(); renderAll(); closeModal();
         toast('导入完成，现有 ' + db.records.length + ' 条档案' +
-              (addedN > 0 ? '（新增 ' + addedN + ' 条）' : (addedN === 0 ? '（没有新增）' : '')));
+              (addedN > 0 ? '（新增 ' + addedN + ' 条）' : (addedN === 0 ? '（没有新增）' : '')) +
+              (tokenKept ? '。已保留你填的令牌/空间地址' : ''));
         };
 
         var incoming = (d.records || []).length;
@@ -7785,6 +7819,118 @@ var ALIGN = {
       settings: db.settings || null,
       settingsAt: db.settingsAt || 0
     };
+  }
+
+  /* ---------------- 令牌体检 ----------------
+   * 用户在 GitHub 上重新生成了令牌，填进来还是 401，而且感觉令牌「被删了」。
+   * 这时候再靠猜已经没意义，必须把令牌本身摊开检查：
+   *   · 设置里到底有没有令牌？（有没有被清成空）
+   *   · 是什么类型？ghp_ = classic（能用），github_pat_ = fine-grained（不能用）
+   *   · 拿它真的去问 GitHub：/user 认不认、gist 接口给不给访问
+   *
+   * 顺带把最坑的一点讲清楚：GitHub 那个「Generate new token ▾」是**下拉按钮**，
+   * 展开后有两项。很多人直接点，默认落到 Fine-grained —— 而 Fine-grained
+   * 官方明确不支持 Gist，于是新令牌生成完就是废的，怎么填都 401。 */
+  function openTokenCheck() {
+    var tk = String((db.settings && db.settings.gistToken) || '').trim();
+    var html = '';
+
+    html += '<div class="sec-title">① 程序里的令牌</div>';
+    if (!tk) {
+      html += '<p class="hint" style="color:#b91c1c"><b>设置里现在是空的 —— 令牌确实没了。</b></p>';
+      html += '<p class="hint">程序<b>不会</b>主动删令牌。常见原因：<br>' +
+        '· 导入了备份文件（覆盖模式会连设置一起盖掉，那份备份里可能没存令牌）<br>' +
+        '· 换过浏览器 / 清过缓存 / 用了无痕模式（令牌存在本机，换环境就没了）<br>' +
+        '· 在别的设备上操作，那台设备本来就没填过</p>';
+      html += '<p class="hint" style="margin-top:8px">重新填一个即可，本机档案不受影响。</p>';
+      openModal('令牌体检', html,
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+         { text: '去填令牌', cls: 'btn primary', fn: function () { closeModal(); setTimeout(openSettings, 150); } }]);
+      return;
+    }
+
+    var head = tk.slice(0, 4);
+    var isClassic = /^ghp_/.test(tk);
+    var isFine = /^github_pat_/.test(tk);
+    html += '<p class="hint">已填：' + esc(head) + '••••（共 ' + tk.length + ' 位）</p>';
+    if (isClassic) {
+      html += '<p class="hint" style="color:#0a7f3f">✓ 类型是 <b>classic</b>（ghp_ 开头），支持 Gist。</p>';
+    } else if (isFine) {
+      html += '<p class="hint" style="color:#b91c1c"><b>✘ 这是 Fine-grained 令牌（github_pat_ 开头）。' +
+        'GitHub 明确不支持用它访问 Gist —— 换什么都没用，必须重新生成 classic 的。</b></p>';
+      html += '<p class="hint">这就是「明明刚生成的新令牌，填进去还是 401」最常见的原因。</p>';
+    } else {
+      html += '<p class="hint" style="color:#b45309">⚠ 前缀不是 ghp_ 也不是 github_pat_，' +
+        '可能复制不完整或混进了别的内容。正常的 classic 令牌是 <b>ghp_</b> 开头的一长串。</p>';
+    }
+
+    openModal('令牌体检', html + '<p class="hint">正在向 GitHub 验证…</p>',
+      [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+
+    var h = { Authorization: 'Bearer ' + tk, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+    var out = '';
+
+    fetch('https://api.github.com/user', { headers: h }).then(function (r) {
+      if (r.status === 401) {
+        out += '<p class="hint" style="color:#b91c1c"><b>✘ GitHub 不认这个令牌（401 Bad credentials）</b></p>';
+        out += '<p class="hint">令牌本身无效：复制不全 / 带了空格 / 已过期 / 被吊销。<br>' +
+          'GitHub 还有一种情况会<b>自动吊销</b>：令牌出现在公开位置（公开仓库、Gist 描述等）会被扫到并作废。' +
+          '如果你之前把备份文件（里面含明文令牌）传到了公开地方，换一个令牌、并别再外传。</p>';
+        return { ok: false };
+      }
+      if (r.status === 403) {
+        out += '<p class="hint" style="color:#b45309"><b>⚠ 被限流了（403）</b>，不是令牌的问题，稍后再试。</p>';
+        return { ok: false };
+      }
+      if (!r.ok) {
+        out += '<p class="hint" style="color:#b91c1c">✘ /user 返回 HTTP ' + r.status + '</p>';
+        return { ok: false };
+      }
+      return r.json().then(function (d) {
+        out += '<p class="hint" style="color:#0a7f3f">✓ 令牌有效，账号：<b>' + esc((d && d.login) || '未知') + '</b></p>';
+        return { ok: true, login: (d && d.login) || '' };
+      });
+    }).then(function (u) {
+      if (!u.ok) return u;
+      /* /user 通过不代表能访问 Gist —— fine-grained 就是卡在这一步。
+       * 再打一次 gists 接口确认权限。 */
+      return fetch('https://api.github.com/gists?per_page=1', { headers: h }).then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          out += '<p class="hint" style="color:#b91c1c"><b>✘ 令牌有效，但访问 Gist 被拒（' + r.status + '）</b></p>';
+          out += '<p class="hint">这说明令牌<b>没勾 gist 权限</b>，或是 Fine-grained（不支持 Gist）。<br>' +
+            '重新生成一个：只勾 <b>gist</b> 这一项，类型必须选 <b>Tokens (classic)</b>。</p>';
+          return { ok: false };
+        }
+        out += '<p class="hint" style="color:#0a7f3f">✓ Gist 访问正常，这个令牌<b>完全可用</b>。</p>';
+        return { ok: true, login: u.login };
+      });
+    }).then(function (u) {
+      var body = html;
+      body += '<div class="sec-title" style="margin-top:14px">② 让 GitHub 自己判断</div>';
+      body += out;
+      if (u && u.ok) {
+        body += '<div style="margin-top:10px;padding:10px;border-radius:8px;background:#e8f7ee;color:#0a7f3f">' +
+          '✓ 令牌没问题，可以去重建云端空间了。</div>';
+      } else {
+        body += '<div class="sec-title" style="margin-top:14px">③ 重新生成（大约 40 秒）</div>';
+        body += '<p class="hint">1. 打开 <b>github.com/settings/tokens</b><br>' +
+          '2. 点 <b>Generate new token ▾</b> —— <b>这是个下拉按钮</b>，' +
+          '展开后会有两个选项，务必选 <b>Tokens (classic)</b>' +
+          '（另一个 Fine-grained 不支持 Gist，选了就白忙）<br>' +
+          '3. 只勾 <b>gist</b> 这一项<br>' +
+          '4. Expiration 选 <b>No expiration</b><br>' +
+          '5. 生成后<b>立刻复制</b>（关掉就看不到了），粘回设置</p>';
+      }
+      openModal('令牌体检', body,
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+         { text: u && u.ok ? '去重建' : '去改令牌', cls: 'btn primary', fn: function () {
+           closeModal(); setTimeout(u && u.ok ? openRebuild : openSettings, 200);
+         } }]);
+    }).catch(function (e) {
+      openModal('令牌体检', html +
+        '<p class="hint" style="color:#b45309">验证时网络错误：' + esc(String(e && e.message || e)) + '</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+    });
   }
 
   /* ---------------- 云端数据完整性验证 ----------------
