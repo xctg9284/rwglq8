@@ -2935,17 +2935,27 @@ var ALIGN = {
    * 单条体积过大、图片数据畸形、张数超限、缺标识……这些都会让整包数据
    * 在上传时膨胀到超限，或者解析时直接失败。
    * 这个功能把"坏在哪一条"直接点出来，而不是让用户对着"同步失败"干瞪眼。 */
+  /* ---------------- 本地数据体检 ----------------
+   * 「一上传就截断」多半不是云端的锅，而是本机某条档案本身就是坏的：
+   * 单条体积过大、图片数据畸形、张数超限、缺标识……这些都会让整包数据
+   * 在上传时膨胀到超限，或者解析时直接失败。
+   *
+   * 【重要】每条问题都必须点名到具体的档案，并给出「定位」按钮 ——
+   * 只报「有 3 条档案有问题」对用户毫无用处，他根本不知道该去改哪一条。
+   * 所以每个 issue 都带 recs:[{id,name,note}]，界面上一一列出并可跳转。 */
   function healthCheck() {
     var capBytes = SHARD_SIZE * SHARD_MAX_PARTS;
-    var issues = [];        // { level:'bad'|'warn', title, detail, fix }
+    var issues = [];        // { level, title, detail, recs:[{id,name,note}], fix }
     var recs = (db.records || []).filter(function (r) { return r && !r.demo; });
-    var totalBytes = 0;
+    function nameOf(r) {
+      return String((r && (r.title || r.code)) || '(无名称)').slice(0, 24);
+    }
+    function item(r, note) { return { id: r && r.id, name: nameOf(r), note: note || '' }; }
 
-    // ① 单条档案体积：这是撑爆上传的头号元凶
+    // ① 单条档案体积：撑爆上传的头号元凶
     var sizes = recs.map(function (r) {
       var b = 0;
       try { b = byteLen(JSON.stringify(r)); } catch (e) { b = 0; }
-      totalBytes += b;
       return { r: r, b: b };
     }).sort(function (a, b2) { return b2.b - a.b; });
     var bigOnes = sizes.filter(function (x) { return x.b > 300 * 1024; });
@@ -2953,74 +2963,76 @@ var ALIGN = {
       issues.push({
         level: bigOnes[0].b > capBytes / 2 ? 'bad' : 'warn',
         title: '有 ' + bigOnes.length + ' 条档案体积过大',
-        detail: bigOnes.slice(0, 5).map(function (x) {
-          return '· 「' + esc(String((x.r.title || x.r.code || '(无名称)')).slice(0, 20)) +
-                 '」' + fmtBytes(x.b);
-        }).join('<br>') + '<br>单条过大会直接把整包撑到上限，上传时被截断。',
+        detail: '单条过大会直接把整包撑到上限，上传时被截断。' +
+                '点「定位」打开该档案，压缩或删掉里面的大图即可。',
+        recs: bigOnes.slice(0, 20).map(function (x) {
+          return item(x.r, fmtBytes(x.b) + '，' + ((x.r.photos || []).length) + ' 张图');
+        }),
         fix: '压缩图片'
       });
     }
 
-    // ② 图片数据畸形 / 空项 / 张数超限
-    var badPhoto = [], emptyItem = 0, overCount = 0, noMark = 0;
+    // ② 图片数据畸形 / 空项 / 张数超限 / 缺标记
+    var badPhotoRecs = [], emptyRecs = [], overRecs = [], noMarkRecs = [];
+    var badPhotoN = 0, emptyItem = 0, noMarkN = 0;
     (db.records || []).forEach(function (r) {
+      if (r && r.demo) return;
       var ps = r && r.photos;
       if (!ps || !ps.length) return;
-      var valid = 0;
-      ps.forEach(function (p) {
-        if (!p) { emptyItem++; return; }
-        if (!p.data) { emptyItem++; return; }
+      var bad = 0, empty = 0, nomark = 0;
+      ps.forEach(function (p, i) {
+        if (!p || !p.data) { empty++; return; }
         var d = String(p.data);
-        if (d.indexOf('data:image/') !== 0) { badPhoto.push(r); return; }
-        if (d.length < 100) { badPhoto.push(r); return; }   // 太短，多半是坏的
-        valid++;
-        if (!p.pid || !p.pq) noMark++;
+        if (d.indexOf('data:image/') !== 0 || d.length < 100) { bad++; return; }
+        if (!p.pid || !p.pq) nomark++;
       });
-      if (ps.length > PHOTO_MAX_COUNT) overCount++;
-      if (valid !== ps.length && ps.length) { /* 上面已统计 */ }
+      if (bad) { badPhotoRecs.push(item(r, '第 ' + (bad) + " 处图片数据不完整")); badPhotoN += bad; }
+      if (empty) { emptyRecs.push(item(r, empty + ' 个空占位')); emptyItem += empty; }
+      if (ps.length > PHOTO_MAX_COUNT) overRecs.push(item(r, ps.length + ' 张（上限 ' + PHOTO_MAX_COUNT + '）'));
+      if (nomark) { noMarkRecs.push(item(r, nomark + " 张缺标记")); noMarkN += nomark; }
     });
-    if (badPhoto.length) {
-      issues.push({
-        level: 'bad',
-        title: '有 ' + badPhoto.length + " 处图片数据不完整",
-        detail: '这些图片的 base64 开头不是 data:image/，或内容过短。' +
-                '它们会把整包数据撑大却无法显示，解析时还可能直接失败。',
-        fix: '清理无效图片'
-      });
+    if (badPhotoN) {
+      issues.push({ level: 'bad', title: '有 ' + badPhotoN + " 处图片数据不完整",
+        detail: 'base64 开头不是 data:image/，或内容过短。' +
+                '它们白占体积却显示不出来，解析时还可能直接失败。',
+        recs: badPhotoRecs, fix: '清理无效图片' });
     }
     if (emptyItem) {
       issues.push({ level: 'warn', title: '有 ' + emptyItem + ' 个空的图片占位',
-        detail: '不影响使用，但白占空间。', fix: '清理无效图片' });
+        detail: '不影响使用，但白占空间。', recs: emptyRecs, fix: '清理无效图片' });
     }
-    if (overCount) {
-      issues.push({ level: 'warn', title: '有 ' + overCount + ' 条档案图片超过 ' + PHOTO_MAX_COUNT + ' 张',
-        detail: '超出部分不会被同步（程序最多保留 ' + PHOTO_MAX_COUNT + ' 张）。', fix: '清理无效图片' });
+    if (overRecs.length) {
+      issues.push({ level: 'warn', title: '有 ' + overRecs.length + ' 条档案图片超过 ' + PHOTO_MAX_COUNT + ' 张',
+        detail: '超出部分不会被同步（程序最多保留 ' + PHOTO_MAX_COUNT + ' 张）。',
+        recs: overRecs, fix: '清理无效图片' });
     }
-    if (noMark) {
-      issues.push({
-        level: 'bad',
-        title: '有 ' + noMark + ' 张图片缺少身份标记',
+    if (noMarkN) {
+      issues.push({ level: 'bad', title: '有 ' + noMarkN + ' 张图片缺少身份标记',
         detail: '这是「同步后图片越变越多」的根因：缺标记的图片在多台设备间' +
                 '会被当成不同的图反复叠加，数据滚雪球式膨胀，最后撑爆上限、同步截断。',
-        fix: '补齐标记'
-      });
+        recs: noMarkRecs, fix: '补齐标记' });
     }
 
     // ③ 记录字段缺失 / 重复 id
-    var noId = 0, seen = {}, dupId = 0;
+    var noIdRecs = [], seen = {}, dupRecs = [];
     recs.forEach(function (r) {
-      if (!r.id) { noId++; return; }
-      if (seen[r.id]) dupId++; else seen[r.id] = 1;
+      if (!r.id) { noIdRecs.push(item(r, '缺少 id')); return; }
+      if (seen[r.id]) dupRecs.push(item(r, '编号与另一条重复：' + r.id));
+      else seen[r.id] = 1;
     });
-    if (noId) issues.push({ level: 'bad', title: '有 ' + noId + ' 条档案没有编号',
-      detail: '没有 id 的档案无法参与合并，会在同步时被反复当成新数据。', fix: null });
-    if (dupId) issues.push({ level: 'bad', title: '有 ' + dupId + ' 条档案编号重复',
-      detail: '编号相同会被当成同一条合并，可能互相覆盖。', fix: null });
+    if (noIdRecs.length) {
+      issues.push({ level: 'bad', title: '有 ' + noIdRecs.length + ' 条档案没有编号',
+        detail: '没有 id 的档案无法参与合并，会在同步时被反复当成新数据。', recs: noIdRecs, fix: null });
+    }
+    if (dupRecs.length) {
+      issues.push({ level: 'bad', title: '有 ' + dupRecs.length + ' 条档案编号重复',
+        detail: '编号相同会被当成同一条合并，可能互相覆盖。', recs: dupRecs, fix: null });
+    }
 
     // ④ 日志过多
     if ((db.logs || []).length > 2000) {
       issues.push({ level: 'warn', title: '变更记录有 ' + db.logs.length + ' 条',
-        detail: '日志是同步数据的大头之一，过多会让每次同步都变慢。', fix: null });
+        detail: '日志是同步数据的大头之一，过多会让每次同步都变慢。', recs: [], fix: null });
     }
 
     // ⑤ 总体积 vs 分片上限
@@ -3029,10 +3041,15 @@ var ALIGN = {
     if (docBytes > capBytes) {
       issues.push({ level: 'bad', title: '本机数据已超过分片上限',
         detail: '当前 ' + fmtBytes(docBytes) + '，上限约 ' + fmtBytes(capBytes) +
-                '。超过就传不上去，或传上去别的设备读不回来（截断）。', fix: '压缩图片' });
+                '。超过就传不上去，或传上去别的设备读不回来（截断）。' +
+                '先处理上面点名的那几条档案。',
+        recs: sizes.slice(0, 10).map(function (x) { return item(x.r, fmtBytes(x.b)); }),
+        fix: '压缩图片' });
     } else if (docBytes > GIST_WARN_LIMIT) {
       issues.push({ level: 'warn', title: '本机数据 ' + fmtBytes(docBytes) + '，偏大',
-        detail: '还没超限，但同步会明显变慢。建议压缩图片。', fix: '压缩图片' });
+        detail: '还没超限，但同步会明显变慢。建议压缩图片。',
+        recs: sizes.slice(0, 10).map(function (x) { return item(x.r, fmtBytes(x.b)); }),
+        fix: '压缩图片' });
     }
 
     // ⑥ 本机存储
@@ -3040,7 +3057,9 @@ var ALIGN = {
     try { storeBytes = byteLen(localStorage.getItem('archive_standalone_v1') || ''); } catch (e) {}
     if (storeBytes > 4.5 * 1024 * 1024) {
       issues.push({ level: 'bad', title: '本机存储快满了（' + fmtBytes(storeBytes) + '）',
-        detail: '浏览器上限约 5 MB。满了之后新建档案会直接失败。', fix: '压缩图片' });
+        detail: '浏览器上限约 5 MB。满了之后新建档案会直接失败。',
+        recs: sizes.slice(0, 10).map(function (x) { return item(x.r, fmtBytes(x.b)); }),
+        fix: '压缩图片' });
     }
 
     return { issues: issues, docBytes: docBytes, capBytes: capBytes, storeBytes: storeBytes };
@@ -3056,21 +3075,45 @@ var ALIGN = {
     if (!res.issues.length) {
       body = head + '<p class="hint" style="color:#0a7d33;font-size:14px">✓ 没发现损坏或异常，本机数据是健康的。</p>';
     } else {
+      var listHtml = function (recs) {
+        if (!recs || !recs.length) return '';
+        return '<div style="margin:6px 0 2px">' + recs.map(function (x, i) {
+          return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:13px">' +
+            '<span style="flex:1;word-break:break-all">· 「<b>' + esc(x.name) + '</b>」' +
+            (x.note ? ' <span style="color:#667085">' + esc(x.note) + '</span>' : '') + '</span>' +
+            (x.id ? '<button class="btn sm" data-loc="' + esc(x.id) + '" style="padding:2px 8px">定位</button>' : '') +
+            '</div>';
+        }).join('') + '</div>';
+      };
       var block = function (list, color, label) {
         if (!list.length) return '';
         return '<p class="hint" style="margin-top:8px"><b style="color:' + color + '">' +
           label + '（' + list.length + ' 项）</b></p>' +
           list.map(function (x) {
             return '<div style="border-left:3px solid ' + color +
-              ';padding:4px 0 4px 8px;margin:6px 0;font-size:13px;line-height:1.7">' +
-              '<b>' + x.title + '</b><br>' + x.detail + '</div>';
+              ';padding:6px 0 6px 8px;margin:8px 0;font-size:13px;line-height:1.7">' +
+              '<b>' + x.title + '</b><br>' +
+              '<span style="color:#667085">' + x.detail + '</span>' +
+              listHtml(x.recs) + '</div>';
           }).join('');
       };
       body = head + block(bad, '#e02424', '需要处理') + block(warn, '#d97706', '建议关注');
     }
     var btns = [{ text: '关闭', cls: 'btn ghost', fn: closeModal }];
+    /* 「只处理这一条」：体检点名了档案，但用户未必想动全部数据。
+     * 给一个针对单条档案的压缩入口，比全局压缩更快也更省。 */
     if (res.issues.length) {
-      btns.unshift({ text: '🗜 去压缩图片', cls: 'btn primary', fn: function () {
+      var bigId = null;
+      for (var i = 0; i < res.issues.length; i++) {
+        var rs = res.issues[i].recs || [];
+        if (rs.length && rs[0].id) { bigId = rs[0].id; break; }
+      }
+      btns.unshift({ text: '🗜 只压缩最大的那条', cls: 'btn', fn: function () {
+        closeModal();
+        if (!bigId) { toast('没有可定位的档案', true); return; }
+        shrinkOneRecord(bigId);
+      } });
+      btns.unshift({ text: '🗜 压缩全部图片', cls: 'btn primary', fn: function () {
         closeModal();
         var pk = photoPresetKey();
         askShrinkPhotos(PHOTO_PRESETS[pk] || PHOTO_PRESETS.normal, pk);
@@ -3080,6 +3123,97 @@ var ALIGN = {
       } });
     }
     openModal('检查本地数据', body, btns);
+    /* 「定位」按钮：直接打开该档案的详情面板。
+     * 只告诉名字还不够 —— 用户还得自己去列表里翻，
+     * 档案一多根本找不到。这里一键打开。 */
+    var m = document.getElementById('modal');
+    if (m) {
+      var lbs = m.querySelectorAll('button[data-loc]');
+      for (var k = 0; k < lbs.length; k++) {
+        (function (btn) {
+          btn.onclick = function () {
+            var id = btn.getAttribute('data-loc');
+            closeModal();
+            setTimeout(function () {
+              var r = findRecord(id);
+              if (!r) { toast('找不到这条档案了', true); return; }
+              openDetail(id);
+            }, 150);
+          };
+        })(lbs[k]);
+      }
+    }
+  }
+
+  /* 压缩单张图片：换数据但保留身份标记。
+   * pid / ow / oh 必须原样带回去，否则别的设备会当成一张新图，同步后变成两张。 */
+  function shrinkOne(p, ps, pk) {
+    return recompressDataUrl(p.data, ps, p.pid).then(function (out) {
+      /* 压完反而更大就保留原图：小图重编码会膨胀，越压越大。 */
+      if (!out || !out.data || String(out.data).length >= String(p.data).length) return false;
+      p.data = out.data; p.w = out.w; p.h = out.h;
+      if (!p.ow || !p.oh) { p.ow = p.w; p.oh = p.h; }
+      p.pq = pk;
+      if (!p.pid) p.pid = out.pid || pidFromPhoto(p);
+      return true;
+    }).catch(function () { return false; });
+  }
+
+  /* 只压缩某一条档案里的图片。
+   * 体检点名了「就是这条太大」，全局压缩会把所有图都重压一遍（慢且没必要），
+   * 单独压这条见效最快。 */
+  function shrinkOneRecord(id) {
+    var r = findRecord(id);
+    if (!r || !r.photos || !r.photos.length) { toast('这条档案没有图片', true); return; }
+    var pk = photoPresetKey();
+    var ps = PHOTO_PRESETS[pk] || PHOTO_PRESETS.normal;
+    var before = 0;
+    r.photos.forEach(function (p) { if (p && p.data) before += String(p.data).length; });
+    openModal('压缩这条档案的图片',
+      '<p class="hint" style="font-size:14px;line-height:1.8">「<b>' +
+      esc(String(r.title || r.code || '(无名称)')) + '</b>」共 ' + r.photos.length +
+      ' 张图，当前占 <b>' + fmtBytes(before) + '</b>。<br>' +
+      '将按「' + esc(ps.label || pk) + '」重新压缩。会变小、同步更快，但图片会略模糊且不可撤销。</p>',
+      [{ text: '取消', cls: 'btn ghost', fn: closeModal },
+       { text: '开始压缩', cls: 'btn primary', fn: function () {
+         $('#modalFoot button').forEach ? null : null;
+         var btns = document.querySelectorAll('#modalFoot button');
+         for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+         var box = document.querySelector('#modal .modal-body');
+         if (box) box.innerHTML = '<p class="hint" id="soMsg">压缩中…</p>';
+         var skipped = 0;                      // 跳过的原因：不是图片 / 已是该档位
+         var tasks = r.photos.map(function (p) {
+           return new Promise(function (done) {
+             if (!p || !p.data) { skipped++; return done(false); }
+             var d = String(p.data);
+             if (d.indexOf('data:image/') !== 0) { skipped++; return done(false); }
+             if (p.pq && photoOrder(p.pq) <= photoOrder(pk)) { skipped++; return done(false); }
+             shrinkOne(p, ps, pk).then(function (ok) {
+               if (!ok) skipped++;
+               done(ok);
+             }).catch(function () { skipped++; done(false); });
+           });
+         });
+         Promise.all(tasks).then(function (rs2) {
+           var ok = rs2.filter(Boolean).length;
+           var after = 0;
+           r.photos.forEach(function (p) { if (p && p.data) after += String(p.data).length; });
+           save(); renderAll(); refreshShrinkBtn();
+           openModal('压缩完成',
+             '<p class="hint" style="font-size:14px;line-height:1.8">' +
+             esc(String(r.title || r.code || '(无名称)')) + '：' +
+             fmtBytes(before) + ' → <b>' + fmtBytes(after) + '</b>' +
+             (after < before ? '（省了 ' + fmtBytes(before - after) + '，约 ' +
+               Math.round((1 - after / before) * 100) + '%）' : '') +
+             '<br>成功压缩 <b>' + ok + '</b> 张' +
+             (skipped ? '，跳过 ' + skipped + ' 张（不是图片、已压过该档位、或压完反而变大）' : '') + '。</p>' +
+             (ok === 0 ? '<p class="hint">没有图片被压缩。这些图可能已经是「' +
+               esc(ps.label || pk) + '」档、或压完会更大。<br>' +
+               '想压得更小，请先到「设置 → 图片清晰度」换成更省流量的档位。</p>' : ''),
+             [{ text: '知道了', cls: 'btn ghost', fn: closeModal },
+              { text: '立即同步', cls: 'btn primary', fn: function () { closeModal(); syncNow(true); } }]);
+         });
+       } }]);
   }
 
   /* 清理无效图片：只删"坏的"，不动任何正常图片。
