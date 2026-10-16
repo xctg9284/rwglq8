@@ -2678,7 +2678,89 @@ var ALIGN = {
    * 会把大数据写成一个超 1 MB 的单文件，同步必然截断。
    * 表现为「每次上传同步就截断」，而用户根本不知道自己跑的是旧版。
    * 有了版本号，一眼就能确认：界面上看到的和我给的是不是同一个。 */
-  var APP_VERSION = '2026.10.16-b4';
+  /* ---------------- 同步日志（真实 HTTP 记录） ----------------
+   * 被「截断」折磨了太多轮，每一轮都在靠推理猜原因，已经猜错过好几次。
+   * 与其继续猜，不如把程序跟 GitHub 之间发生的每一次真实对话记下来：
+   * 请求了什么、GitHub 回了什么状态、返回了几个文件、哪个文件被标记为截断。
+   *
+   * 这些是 GitHub 自己说的话，不是推测。有了它，一眼就能定案：
+   * - 404：空间不存在 / 令牌属于别的账号（私有 Gist 只有创建者能访问）
+   * - 401：令牌无效
+   * - 403：限流或没权限
+   * - 200 但文件 truncated:true：才是真的「数据被截断」
+   * - 200 且全 false：数据完整，界面上任何「截断」字样都是误报 */
+  var syncLog = [];
+  var SYNC_LOG_MAX = 40;
+  function logSync(o) {
+    try {
+      o.t = Date.now();
+      syncLog.push(o);
+      if (syncLog.length > SYNC_LOG_MAX) syncLog.shift();
+      localStorage.setItem('archive_synclog_v1', JSON.stringify(syncLog.slice(-20)));
+    } catch (e) {}
+  }
+  function loadSyncLog() {
+    try {
+      var raw = localStorage.getItem('archive_synclog_v1');
+      if (raw) syncLog = JSON.parse(raw) || [];
+    } catch (e) { syncLog = []; }
+  }
+  function logTime(t) {
+    var d = new Date(t);
+    function pad(n) { return n < 10 ? '0' + n : '' + n; }
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  /* 只包装 github api 的 fetch，不碰业务代码里几十处调用点。
+   * 记录的是 clone 出来的响应，不影响原本的读取（响应体只能读一次）。 */
+  (function () {
+    var _f = window.fetch;
+    window.fetch = function () {
+      var args = arguments;
+      var url = '';
+      try { url = String(args[0] && args[0].url ? args[0].url : args[0]); } catch (e) { url = ''; }
+      var method = 'GET';
+      try { method = (args[1] && args[1].method) || 'GET'; } catch (e) { method = 'GET'; }
+      var isGh = /api\.github\.com/.test(url);
+      var isRaw = /gist.githubusercontent\.com|raw\.githubusercontent/.test(url);
+      if (!isGh && !isRaw) return _f.apply(this, args);
+      var shortUrl = url.replace('https://api.github.com', '')
+        .replace(/\/gists\/([0-9a-f]{4})[0-9a-f]*/, '/gists/$1…');
+      var reqBytes = 0;
+      try { if (args[1] && args[1].body) reqBytes = byteLen(String(args[1].body)); } catch (e) {}
+      var t0 = Date.now();
+      return _f.apply(this, args).then(function (r) {
+        var st = r.status;
+        var entry = { m: method, u: shortUrl, st: st, ms: Date.now() - t0, req: reqBytes };
+        if (isGh && /\/gists\//.test(url) && method === 'GET') {
+          try {
+            r.clone().json().then(function (d) {
+              var files = (d && d.files) || {};
+              var names = Object.keys(files);
+              var trunc = names.filter(function (n) { return files[n] && files[n].truncated; });
+              entry.files = names.length;
+              entry.trunc = trunc;
+              entry.sizes = names.slice().sort().map(function (n) {
+                return n + ':' + Math.round(((files[n].size || (files[n].content || '').length) || 0) / 1024) + 'KB';
+              });
+              logSync(entry);
+            }).catch(function () { logSync(entry); });
+          } catch (e) { logSync(entry); }
+        } else if (isGh && /\/gists\//.test(url) && method === 'PATCH') {
+          entry.note = '写入';
+          logSync(entry);
+        } else {
+          logSync(entry);
+        }
+        return r;
+      }).catch(function (e) {
+        logSync({ m: method, u: shortUrl, st: '网络错误', ms: Date.now() - t0, req: reqBytes, err: String(e && e.message || e).slice(0, 80) });
+        throw e;
+      });
+    };
+  })();
+
+  var APP_VERSION = '2026.10.16-b5';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -7052,6 +7134,9 @@ var ALIGN = {
         ? '<button class="btn primary" id="bkDiag">🔍 同步诊断（查多设备为什么不互通）</button>' : '') +
       (db.settings.syncOn && db.settings.room && db.settings.provider === 'gist'
         ? '<button class="btn primary" id="bkCloudInt">☁ 验证云端数据完整性</button>' : '') +
+      '<button class="btn primary" id="bkSyncLog">📋 同步日志（看真实 HTTP 记录）</button>' +
+      (db.settings.syncOn && db.settings.provider === 'gist'
+        ? '<button class="btn danger" id="bkRebuild">🚑 重建云端空间（根治截断）</button>' : '') +
       (photoStats().count ? '<button class="btn" id="bkDedupePhoto" style="margin-top:8px">🧹 清理重复图片</button>' : '') +
       '</div>' +
       (db.settings.provider === 'gist' && db.settings.room
@@ -7096,6 +7181,10 @@ var ALIGN = {
     if (dg) dg.onclick = function () { closeModal(); setTimeout(openDiag, 200); };
     var ci = $('#bkCloudInt');
     if (ci) ci.onclick = function () { closeModal(); setTimeout(openCloudIntegrity, 200); };
+    var sl = $('#bkSyncLog');
+    if (sl) sl.onclick = function () { closeModal(); setTimeout(openSyncLog, 200); };
+    var rb = $('#bkRebuild');
+    if (rb) rb.onclick = function () { closeModal(); setTimeout(openRebuild, 200); };
     /* 这个按钮是备份面板里的，面板 HTML 动态生成，
      * 必须在这里（生成之后）绑定，放在 init 里会拿到 null。 */
     var dpp = $('#bkDedupePhoto');
@@ -7314,6 +7403,257 @@ var ALIGN = {
    * 多台设备互不相通时，最常见的原因是「不在同一个云端空间」。
    * 用户从界面上完全看不出来：两边都显示绿点、都提示"已同步"，
    * 但数据各走各的。这里把关键事实直接摊开，让人一眼能比对。 */
+  /* ---------------- 一键根治截断（重建云端空间） ----------------
+   * 用户被「截断」反复折磨，修修补补已经不够了，必须能一键推倒重建。
+   *
+   * 截断为什么阴魂不散：云端可能残留着旧版程序写的「超大单文件」
+   * （一个 archive-sync.json 就 3 MB）。只要它还在，
+   * 每次读取都会命中 truncated=true → 报「数据太大读不回来」，
+   * 哪怕我们后来写的分片都是完好的，也会被它一票否决。
+   *
+   * 所以根治的办法只有一个：**不读旧数据，直接强制覆盖**。
+   * 流程：清空云端全部文件 → 按 256 KB 重新分片写入 → 最后写索引 →
+   * 再读一次验证，把每个分片的大小和 truncated 标志摆给用户看。
+   *
+   * 安全兜底：重建前先试着读一次云端（含 raw 兜底），读到了就合并，
+   * 保证不会因为重建而丢掉别的设备传上去的数据；
+   * 读不到（本来就是截断/404）才退化为只用本机，并明确告知。 */
+  function openRebuild() {
+    if (!db.settings.syncOn) {
+      openModal('重建云端空间', '<p class="hint">还没开启云同步。</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+         { text: '去设置', cls: 'btn primary', fn: function () { closeModal(); setTimeout(openSettings, 150); } }]);
+      return;
+    }
+    if (db.settings.provider !== 'gist') {
+      openModal('重建云端空间', '<p class="hint">当前服务商不是 GitHub Gist，不需要这项操作。</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+      return;
+    }
+    var localN = syncableRecords().length;
+    openModal('重建云端空间',
+      '<div class="sec-title">这个按钮做什么</div>' +
+      '<p class="hint">把云端<b>整个推倒重建</b>，彻底根治「数据截断」：' +
+      '清空云端所有文件 → 按 ' + fmtBytes(SHARD_SIZE) + ' 重新分片写入 → 自动验证。</p>' +
+      '<p class="hint">截取根因：云端可能残留旧版程序写的<b>超大单文件</b>（一个就好几 MB）。' +
+      '只要它在，每次读取都会被判定截断，我们后来写的好分片也被它一票否决。' +
+      '所以必须强制覆盖，光靠后续同步是修不好的。</p>' +
+      '<div class="sec-title" style="margin-top:12px">会丢数据吗</div>' +
+      '<p class="hint">重建前会先试着读一次云端，<b>读到了就自动合并</b>，' +
+      '所以别的设备传上去的数据不会丢。读不到（本来就是截断或空间不存在）才只用本机。</p>' +
+      '<p class="hint">本机待重建：<b>' + localN + '</b> 条档案</p>' +
+      '<p class="hint" style="color:#b91c1c">建议先「导出备份文件」留一份，再点重建。</p>',
+      [{ text: '取消', cls: 'btn ghost', fn: closeModal },
+       { text: '开始重建', cls: 'btn primary', fn: function () { closeModal(); setTimeout(doRebuild, 200); } }]);
+  }
+
+  function doRebuild() {
+    var steps = [];
+    function log(t) { steps.push(t); renderStep(); }
+    function renderStep() {
+      openModal('正在重建云端空间',
+        steps.map(function (t) { return '<p class="hint" style="margin:3px 0">· ' + esc(t) + '</p>'; }).join('') +
+        '<p class="hint" style="margin-top:8px;color:#667085">请勿关闭页面…</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+    }
+    renderStep();
+
+    var room = String(db.settings.room || '').trim();
+    var h;
+    try { h = PROVIDERS.gist.hdr(); } catch (e) {
+      openModal('重建失败', '<p class="hint" style="color:#b91c1c">' + esc(e.message) + '</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+      return;
+    }
+
+    /* 第 1 步：尽量救回云端数据（能读就合并，读不到也不算失败） */
+    var savedRemote = null, readErr = '';
+    function tryRead() {
+      if (!room) return Promise.resolve(null);
+      log('读取现有云端（尽量救回数据）…');
+      return safeCall(function () { return PROVIDERS.gist.read(room); })
+        .then(function (rem) {
+          var d = normaliseRemote(rem);
+          var n = (d.records || []).filter(function (r) { return !r.demo; }).length;
+          if (n > 0) { log('✓ 云端读到 ' + n + ' 条，将合并进重建'); savedRemote = d; }
+          else log('云端没有可读档案，用本机数据重建');
+          return d;
+        })
+        .catch(function (e) {
+          readErr = (e && e.message) ? e.message : String(e);
+          log('云端读不出来（' + (readErr.length > 40 ? readErr.slice(0, 40) + '…' : readErr) + '），用本机数据重建');
+          return null;
+        });
+    }
+
+    /* 第 2 步：确定用哪个 Gist；不存在就新建 */
+    function ensureRoom() {
+      if (!room) {
+        log('还没填空间地址，正在新建一个…');
+        return PROVIDERS.gist.create().then(function (id) {
+          db.settings.room = id; save();
+          room = id;
+          log('✓ 已创建空间 ' + id.slice(0, 8) + '…');
+          return id;
+        });
+      }
+      // 已填：确认它是否存在，不存在就新建一个
+      return fetch('https://api.github.com/gists/' + encodeURIComponent(room), { headers: h })
+        .then(function (r) {
+          if (r.ok) { log('✓ 空间存在：' + room.slice(0, 8) + '…'); return room; }
+          if (r.status === 404) {
+            log('这个空间不存在（404），正在新建一个…');
+            return PROVIDERS.gist.create().then(function (id) {
+              db.settings.room = id; save(); room = id;
+              log('✓ 已创建空间 ' + id.slice(0, 8) + '…');
+              return id;
+            });
+          }
+          throw new Error('查询空间失败（HTTP ' + r.status + '）');
+        });
+    }
+
+    /* 第 3 步：清空云端全部文件（这是根治的关键 —— 把旧的大文件彻底抹掉） */
+    function wipe(rid) {
+      log('清空云端全部文件（抹掉旧的大文件）…');
+      var del = { files: {} };
+      del.files['archive-sync.json'] = null;
+      for (var i = 1; i <= SHARD_MAX_PARTS + 8; i++) del.files['arc-part-' + i + '.json'] = null;
+      return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
+        method: 'PATCH', headers: h, body: JSON.stringify(del)
+      }).then(function (r) {
+        if (!r.ok) throw new Error('清空失败（HTTP ' + r.status + '）');
+        log('✓ 云端已清空');
+        return true;
+      });
+    }
+
+    tryRead().then(ensureRoom).then(function (rid) {
+      return wipe(rid).then(function () { return rid; });
+    }).then(function (rid) {
+      /* 合并数据：本机 ∪ 云端，谁新留谁 */
+      log('准备数据…');
+      var merged = null;
+      if (savedRemote) {
+        try { merged = mergeDocs(buildLocalDoc(), savedRemote); }
+        catch (e) { merged = buildLocalDoc(); }
+      } else {
+        merged = buildLocalDoc();
+      }
+      var txt = JSON.stringify(merged);
+      var bl = byteLen(txt);
+      log('数据共 ' + fmtBytes(bl) + '，开始分片写入…');
+
+      /* 分片并分批写入 */
+      var parts = (bl > SHARD_THRESHOLD) ? shardText(txt, SHARD_SIZE) : null;
+      var plan = [], idx = null, names = [];
+      if (parts && parts.length > 1) {
+        parts.forEach(function (pt, i) {
+          var nm = 'arc-part-' + (i + 1) + '.json';
+          names.push(nm);
+          var last = plan[plan.length - 1];
+          var sz = byteLen(pt) + 64;
+          if (!last || last._bytes + sz > PAYLOAD_SAFE) { last = { files: {}, _bytes: 0 }; plan.push(last); }
+          last.files[nm] = { content: pt };
+          last._bytes += sz;
+        });
+        idx = JSON.stringify({
+          app: 'archive', v: 2, sharded: true, parts: names, bytes: bl,
+          updatedAt: Date.now(), client: (db.settings.clientId || '')
+        });
+      } else {
+        plan.push({ files: {}, _bytes: 0 });
+        plan[0].files['archive-sync.json'] = { content: txt };
+        plan[0]._bytes = bl;
+      }
+
+      var chain = Promise.resolve();
+      plan.forEach(function (st, i) {
+        chain = chain.then(function () {
+          return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
+            method: 'PATCH', headers: h, body: JSON.stringify({ files: st.files })
+          }).then(function (r) {
+            if (!r.ok) throw new Error('写入分片失败（HTTP ' + r.status + '）');
+            log('✓ 已写入第 ' + (i + 1) + '/' + plan.length + ' 批');
+          });
+        });
+      });
+      if (idx) {
+        chain = chain.then(function () {
+          var f = {}; f['archive-sync.json'] = { content: idx };
+          return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
+            method: 'PATCH', headers: h, body: JSON.stringify({ files: f })
+          }).then(function (r) {
+            if (!r.ok) throw new Error('写入索引失败（HTTP ' + r.status + '）');
+            log('✓ 已写入索引（共 ' + names.length + ' 片）');
+          });
+        });
+      }
+      return chain.then(function () { return rid; });
+    }).then(function (rid) {
+      /* 第 4 步：回读验证，把证据摆出来 */
+      log('回读验证…');
+      syncState.lastShardCount = 0;
+      quota.etag = ''; saveQuota();
+      return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), { headers: h })
+        .then(function (r) {
+          if (!r.ok) throw new Error('验证时读取失败（HTTP ' + r.status + '）');
+          return r.json();
+        }).then(function (d) {
+          var files = (d && d.files) || {};
+          var list = Object.keys(files);
+          var bad = list.filter(function (n) { return files[n] && files[n].truncated; });
+          var rows = list.slice().sort().map(function (n) {
+            var f = files[n];
+            var sz = (f && (f.size || (f.content || '').length)) || 0;
+            return '<tr style="border-top:1px solid #eceff3"><td style="padding:3px 2px">' + esc(n) +
+              '</td><td style="padding:3px 2px">' + fmtBytes(sz) +
+              '</td><td style="padding:3px 2px;color:' + (f && f.truncated ? '#b91c1c' : '#0a7f3f') + '">' +
+              (f && f.truncated ? '是' : '否（完整）') + '</td></tr>';
+          }).join('');
+
+          var html = '<p class="hint">云端现有 <b>' + list.length + '</b> 个文件：</p>';
+          html += '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+            '<tr style="text-align:left;color:#667085"><th>文件</th><th>大小</th><th>被截断？</th></tr>' + rows + '</table>';
+          html += '<div style="margin-top:12px;padding:10px;border-radius:8px;background:' +
+            (bad.length ? '#fdecea' : '#e8f7ee') + ';color:' + (bad.length ? '#b91c1c' : '#0a7f3f') + '">' +
+            (bad.length
+              ? '✘ 仍有文件被截断：' + bad.join('、') + '。请压缩图片后再重建一次。'
+              : '✓ <b>重建成功，截断已根治</b>。全部文件都在 1 MB 以内，所有设备都能完整读回。') + '</div>';
+          if (!bad.length) {
+            html += '<p class="hint" style="margin-top:10px">空间编号：<b>' + esc(rid) + '</b>（已自动填入设置）</p>';
+            html += '<p class="hint">其它设备请打开这个同一网址，或把上面这个编号填进「设置 → 云端空间地址」，' +
+              '再点一次云同步即可。</p>';
+          }
+          html += '<p class="hint" style="margin-top:10px;color:#667085">' +
+            '注：GitHub <b>网页</b>上可能仍显示「此文件已被截断」，那是网页渲染限制（约几百 KB），' +
+            '与数据完整性无关。判断依据只看上表「被截断」列。</p>';
+
+          openModal('重建完成', html,
+            [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+             { text: '立即同步', cls: 'btn primary', fn: function () { closeModal(); setTimeout(function () { syncNow(true); }, 200); } }]);
+          renderAll();
+        });
+    }).catch(function (e) {
+      openModal('重建失败',
+        '<p class="hint" style="color:#b91c1c">' + esc((e && e.message) ? e.message : String(e)) + '</p>' +
+        '<p class="hint">' + steps.map(function (t) { return '· ' + esc(t); }).join('<br>') + '</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+    });
+  }
+
+  /* 把本机数据打包成要上传的文档结构 */
+  function buildLocalDoc() {
+    return {
+      app: 'archive', v: 2, updatedAt: Date.now(),
+      records: syncableRecords().map(function (r) { return JSON.parse(JSON.stringify(r)); }),
+      logs: (db.logs || []).slice(-500),
+      deleted: (db.deleted || []).slice(-500),
+      settings: db.settings || null,
+      settingsAt: db.settingsAt || 0
+    };
+  }
+
   /* ---------------- 云端数据完整性验证 ----------------
    * 用户反复问「为什么 GitHub 网页上还是显示『此文件已被截断』」。
    * 那个提示是 GitHub **网页渲染**的限制（官方支持回复：blob 展示上限约
@@ -7323,6 +7663,89 @@ var ALIGN = {
    *
    * 与其反复解释，不如让程序自己把证据摆出来：直接问 GitHub，
    * 把每个分片的大小和 truncated 标志列出来，并真的拼起来解一次。 */
+  /* ---------------- 同步日志面板 ----------------
+   * 把 syncLog 里记的真实 HTTP 交互摊开给用户看。
+   * 这是「到底是不是真截断」的唯一权威依据 —— GitHub 自己说的话。 */
+  function openSyncLog() {
+    loadSyncLog();
+    var html = '';
+    if (!syncLog.length) {
+      html += '<p class="hint">还没有任何同步记录。请先点一次「云同步」，再回来看这里。</p>';
+    } else {
+      html += '<p class="hint">下面是程序跟 GitHub 的<b>真实对话记录</b>（最近 ' + syncLog.length + ' 条）。' +
+        '这是判断问题的最权威依据 —— 全是 GitHub 自己返回的状态，不是推测。</p>';
+      html += '<div class="sec-title" style="margin-top:10px">怎么看懂</div>';
+      html += '<p class="hint">' +
+        '<b>200 + 被截断：无</b> → 数据完整，界面上任何「截断」字样都是误报，可以放心。<br>' +
+        '<b>200 + 被截断：arc-part-X</b> → 才是真的被截断（单文件超 1 MB）。<br>' +
+        '<b>404</b> → 空间不存在，或令牌属于另一个账号（私有 Gist 只有创建者能看到）。<br>' +
+        '<b>401</b> → 令牌无效或过期。<br>' +
+        '<b>403</b> → 额度用尽，或令牌没勾 gist 权限。<br>' +
+        '<b>413</b> → 请求体超 1 MB 被拒（已在最新版修复）。</p>';
+
+      html += '<div class="sec-title" style="margin-top:14px">记录</div>';
+      html += '<div style="max-height:340px;overflow:auto;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace">';
+      syncLog.slice().reverse().forEach(function (e) {
+        var st = e.st;
+        var color = (st === 200 || st === 304) ? '#0a7f3f' : '#b91c1c';
+        if (String(st).indexOf('网络') >= 0) color = '#b45309';
+        html += '<div style="padding:6px 0;border-bottom:1px solid #eceff3">' +
+          '<b>' + logTime(e.t) + '</b> ' +
+          '<span style="color:' + color + '">' + esc(String(st)) + '</span> ' +
+          esc(e.m) + ' ' + esc(e.u) +
+          (e.ms ? ' <span style="color:#98a2b3">' + e.ms + 'ms</span>' : '') +
+          (e.req ? ' <span style="color:#98a2b3">请求体' + Math.round(e.req / 1024) + 'KB</span>' : '') +
+          (e.err ? '<br><span style="color:#b45309">' + esc(e.err) + '</span>' : '');
+        if (e.files != null) {
+          html += '<br>返回 ' + e.files + ' 个文件，被截断：<b style="color:' +
+            (e.trunc && e.trunc.length ? '#b91c1c' : '#0a7f3f') + '">' +
+            (e.trunc && e.trunc.length ? e.trunc.join(',') : '无') + '</b>';
+          if (e.sizes && e.sizes.length) html += '<br><span style="color:#667085">' + esc(e.sizes.join('  ')) + '</span>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+
+      var plain = syncLog.slice().map(function (e) {
+        return logTime(e.t) + ' ' + e.st + ' ' + e.m + ' ' + e.u +
+          (e.req ? ' req=' + Math.round(e.req / 1024) + 'KB' : '') +
+          (e.files != null ? ' files=' + e.files + ' truncated=' + ((e.trunc && e.trunc.length) ? e.trunc.join(',') : 'none') : '') +
+          (e.err ? ' err=' + e.err : '');
+      }).join('\n');
+
+      html += '<div style="margin-top:10px"><button class="btn sm" id="slCopy">复制全部（发给别人排查）</button>' +
+        ' <button class="btn sm" id="slClear">清空记录</button></div>';
+      openModal('同步日志（真实 HTTP 记录）', html,
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+         { text: '重新同步一次', cls: 'btn primary', fn: function () {
+           closeModal();
+           toast('正在同步，完成后回来看记录…', false);
+           setTimeout(function () { if (typeof syncNow === 'function') syncNow(true); }, 200);
+         } }]);
+      var cb = document.getElementById('slCopy');
+      if (cb) cb.onclick = function () {
+        try {
+          if (navigator.clipboard) navigator.clipboard.writeText(plain);
+          else throw new Error('no clipboard');
+          toast('已复制同步日志', false);
+        } catch (e) {
+          openModal('同步日志（复制）',
+            '<textarea style="width:100%;height:220px;font-size:12px">' + esc(plain) + '</textarea>',
+            [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+        }
+      };
+      var cl = document.getElementById('slClear');
+      if (cl) cl.onclick = function () {
+        syncLog = [];
+        try { localStorage.removeItem('archive_synclog_v1'); } catch (e) {}
+        closeModal(); setTimeout(openSyncLog, 150);
+      };
+      return;
+    }
+    openModal('同步日志（真实 HTTP 记录）', html,
+      [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+  }
+
   function openCloudIntegrity() {
     if (!db.settings.syncOn || !db.settings.room) {
       openModal('云端数据完整性', '<p class="hint">还没开启云同步，或没填云端空间地址。</p>',
@@ -8485,6 +8908,7 @@ var ALIGN = {
     })();
 
     loadQuota();
+    loadSyncLog();
     loadPushed();
     renderQuota();
     route();
