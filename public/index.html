@@ -2386,8 +2386,21 @@ var ALIGN = {
     }
   }
 
-  var syncState = { lastFailReason: '', lastAt: 0, busy: false, timer: null, ok: null, backoffUntil: 0, lastPushed: '', pendingRemoteSettings: false, dirty: false, phaseTm: 0, lastRemoteFp: '', lastForcePushAt: 0, forcePush: false, lastRemoteCount: null, tooBig: 0, lastShardCount: 0, sawTruncatedSingle: false, sawSharded: false };
+  var syncState = { lastFailReason: '', lastAt: 0, busy: false, timer: null, ok: null, backoffUntil: 0, lastPushed: '', pendingRemoteSettings: false, dirty: false, phaseTm: 0, lastRemoteFp: '', lastForcePushAt: 0, forcePush: false, lastRemoteCount: null, tooBig: 0, lastShardCount: 0, sawTruncatedSingle: false, sawSharded: false, gistOwner: '' };
   var clientId = '';
+  /* 云端空间归属的 GitHub 账号（上次成功读到时记下的），
+   * 存本地是为了没同步过也能显示，方便排查「数据去哪了」。 */
+  var GIST_OWNER_KEY = 'archive_gist_owner';
+  function loadGistOwner() {
+    try { syncState.gistOwner = localStorage.getItem(GIST_OWNER_KEY) || ''; } catch (e) {}
+  }
+  function gistOwnerText() {
+    var o = String(syncState.gistOwner || '').trim();
+    if (!o) return '';
+    return '· 这个云端空间属于 GitHub 账号 <b>' + esc(o) + '</b>，' +
+      '去 <b>gist.github.com/' + esc(o) + '</b> 用<b>这个账号</b>登录才看得到。<br>' +
+      '（在别的账号页面里看不到它，列表显示 0 个不代表数据没了）';
+  }
   // 是否运行在微信内置浏览器（微信里不能下载文件、不能直接打开本地网页）
   var IS_WX = /micromessenger/i.test((navigator && navigator.userAgent) || '');
 
@@ -3507,6 +3520,7 @@ var ALIGN = {
     return docFingerprint(syncableRecords(), db.logs, db.deleted);
   }
   function loadPushed() {
+    loadGistOwner();
     try { syncState.lastPushed = localStorage.getItem(PUSHED_KEY) || ''; } catch (e) {}
   }
   function savePushed(fp) {
@@ -3622,6 +3636,15 @@ var ALIGN = {
        * 这正是突破「单个文件最多 1 MB」限制的关键。 */
       parseDoc: function (d) {
         var self = PROVIDERS.gist;
+        /* 记下这个云端空间属于哪个 GitHub 账号。
+         * 「用了段时间云端数据不见了」最常见的原因就是账号搞错：
+         * 程序用 A 账号的令牌建的空间，用户却登录 B 账号去 Gist 页面找，
+         * 那里当然是 0 个 —— 数据其实一直好好的。
+         * 把归属账号显示出来，一眼就能确认，不用再瞎猜。 */
+        if (d && d.owner && d.owner.login) {
+          syncState.gistOwner = d.owner.login;
+          try { localStorage.setItem(GIST_OWNER_KEY, d.owner.login); } catch (e) {}
+        }
         var f = d && d.files && d.files[self.file];
         if (!f) throw new Error('Gist 里没有数据文件，可能被删了或填错了编号');
         var txt = (typeof f.content === 'string') ? f.content : '';
@@ -5390,11 +5413,13 @@ var ALIGN = {
         '要真正分开，得用<b>不同的 GitHub 账号</b>。省额度的正路是把同步间隔调大。</span></p></div>' +
       '<div class="field"><label>云端空间地址 / 编号</label>' +
         '<input type="text" id="setRoom" placeholder="点右侧「创建云端空间」自动生成" value="' + esc(s.room) + '">' +
-        '<p class="hint" id="roomHint"></p></div>' +
+        '<p class="hint" id="roomHint"></p>' +
+        '<p class="hint" id="gistOwnerHint"></p></div>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">' +
         '<button class="btn sm" id="btnCreateRoom">创建云端空间</button>' +
         '<button class="btn sm danger" id="btnClearCloud">清空云端数据</button>' +
         '<button class="btn sm" id="btnOpenGist">🌐 在 GitHub 上打开</button>' +
+        '<button class="btn sm" id="btnRoomDiag">🔍 排查云端空间</button>' +
         '<button class="btn sm" id="btnTestRoom">测试连接</button>' +
         '<button class="btn sm" id="btnQuota">📊 查看剩余额度</button>' +
         '<button class="btn sm" id="btnQuotaDiag">🔬 额度诊断</button>' +
@@ -5610,6 +5635,86 @@ var ALIGN = {
         function () { setTimeout(showDeleteGistHelp, 150); }
       );
     };
+    /* 「云端数据不见了」的终极排查：直接问 GitHub 三件事 ——
+     * ① 这个令牌属于哪个账号  ② 这个账号下有哪些 Gist  ③ 程序填的编号在不在里面。
+     * 三相对照，数据到底在不在、在哪个账号、编号对不对，一次说清，不用再猜。 */
+    var rd = document.getElementById('btnRoomDiag');
+    if (rd) rd.onclick = function () {
+      var inpEl = document.getElementById('setToken');
+      var tk = inpEl && inpEl.value ? inpEl.value.trim()
+        : String((db.settings && db.settings.gistToken) || '').trim();
+      var inpR = document.getElementById('setRoom');
+      var room = String((inpR && inpR.value) || db.settings.room || '').trim();
+      if (!tk) { toast('请先填 GitHub 令牌', true); return; }
+      var provSel = document.getElementById('setProvider');
+      var prov = provSel ? provSel.value : db.settings.provider;
+      if (prov !== 'gist') { toast('这个功能只支持 GitHub Gist', true); return; }
+      room = String(normalizeRoom(room, prov) || '').trim();
+      var hdr = { Accept: 'application/vnd.github+json',
+                  Authorization: 'Bearer ' + tk,
+                  'X-GitHub-Api-Version': '2022-11-28' };
+      toast('正在排查…', false);
+      Promise.all([
+        fetch('https://api.github.com/user', { headers: hdr })
+          .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+        fetch('https://api.github.com/gists?per_page=100', { headers: hdr })
+          .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; })
+      ]).then(function (res) {
+        var me = res[0], gists = res[1];
+        var login = (me && me.login) || '';
+        var lines = [];
+        lines.push('<b>① 当前令牌属于账号：</b>' + (login ? esc(login) : '<span style="color:#e02424">读不到（令牌无效或权限不足）</span>'));
+        var list = Array.isArray(gists) ? gists : null;
+        if (!list) {
+          lines.push('<b>② 这个账号下的 Gist：</b><span style="color:#e02424">读不到</span>');
+        } else {
+          lines.push('<b>② 这个账号下共有 ' + list.length + ' 个 Gist</b>（含 secret）：');
+          if (!list.length) {
+            lines.push('&nbsp;&nbsp;<span style="color:#e02424">一个都没有</span>');
+          } else {
+            lines.push('<table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px">' +
+              list.slice(0, 30).map(function (g) {
+                var isCur = room && String(g.id) === room;
+                return '<tr style="' + (isCur ? 'background:#e6f4ea' : '') + '">' +
+                  '<td style="padding:3px 6px;border-bottom:1px solid #eee;word-break:break-all">' +
+                  esc(String(g.id)) + (isCur ? ' <b>← 程序正在用这个</b>' : '') + '</td>' +
+                  '<td style="padding:3px 6px;border-bottom:1px solid #eee;white-space:nowrap">' +
+                  esc(String((g.description || '').slice(0, 24) || '(无描述)')) + '</td></tr>';
+              }).join('') + '</table>');
+          }
+        }
+        var inList = list ? list.some(function (g) { return room && String(g.id) === room; }) : false;
+        lines.push('<b>③ 程序填的编号：</b>' + (room ? esc(room) : '<span style="color:#e02424">还没填</span>'));
+        var concl = '';
+        if (!room) {
+          concl = '还没填云端空间地址，先点「创建云端空间」。';
+        } else if (!login) {
+          concl = '<span style="color:#e02424">令牌读不到账号信息，多半是令牌无效/过期/权限不够。请重新生成一个只勾 gist 的 classic 令牌。</span>';
+        } else if (!list) {
+          concl = '<span style="color:#e02424">读不到 Gist 列表，可能网络不通或被限流。等一会儿再试。</span>';
+        } else if (inList) {
+          concl = '<span style="color:#0a7d33">✓ 编号在账号里，云端空间是存在的。</span>' +
+            '那么「数据不见」是内容被清空了（比如误点了「清空云端数据」），不是空间丢了 —— 可用「🕐 从云端历史找回」。';
+        } else if (!list.length) {
+          concl = '<span style="color:#e02424">这个账号（' + esc(login) + '）下一个 Gist 都没有。</span>' +
+            '说明你要找的空间<b>不在这个账号下</b> —— 它属于当初创建时那个令牌所属的账号。' +
+            '请确认程序里填的令牌是不是那个账号的。';
+        } else {
+          concl = '<span style="color:#e02424">账号里有 ' + list.length + ' 个 Gist，但没有程序填的这个编号。</span>' +
+            '要么编号填错了，要么空间在别的账号下。请对照上面的表，选一个正确的编号填进去。';
+        }
+        openModal('排查云端空间',
+          '<p class="hint" style="font-size:13px;line-height:1.8">' + lines.join('<br>') + '</p>' +
+          '<p class="hint" style="font-size:13px;line-height:1.7;margin-top:10px;border-left:3px solid #2563eb;padding-left:8px">' +
+          '<b>结论：</b>' + concl + '</p>',
+          [{ text: '知道了', cls: 'btn primary', fn: closeModal }]);
+      });
+    };
+    var goh = document.getElementById('gistOwnerHint');
+    if (goh) {
+      var ot = gistOwnerText();
+      goh.innerHTML = ot ? ('<br>' + ot) : '';
+    }
     var og = $('#btnOpenGist');
     if (og) og.onclick = function () {
       /* 优先读输入框里的当前值，而不是已保存的设置。
@@ -5631,7 +5736,10 @@ var ALIGN = {
         '但直接访问上面的地址<b>不登录也能看内容</b>。<br>' +
         '· 里面是<b>明文</b>的档案数据（含图片 base64），' +
         '<b>不要在投屏、录屏或公共场合打开</b>，也别把网址随手转发给别人。<br>' +
-        '· 里面唯一的文件名是 <b>archive-sync.json</b>，点开就是全部数据。',
+        '· 里面唯一的文件名是 <b>archive-sync.json</b>，点开就是全部数据。<br>' +
+        (gistOwnerText() ? gistOwnerText() + '<br>' : '') +
+        '· <b>如果打开是 404</b>：说明这个 Gist 确实没了（被删了或编号错了），' +
+        '而不是"藏起来了" —— 这时请重建空间并用备份恢复。',
         '打开',
         function () { try { window.open(url, '_blank'); } catch (e) { toast('打开失败，请手动复制地址', true); } },
         null,
