@@ -2760,7 +2760,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.16-b6';
+  var APP_VERSION = '2026.10.16-b7';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -7549,17 +7549,49 @@ var ALIGN = {
         });
     }
 
-    /* 第 3 步：清空云端全部文件（这是根治的关键 —— 把旧的大文件彻底抹掉） */
-    function wipe(rid) {
-      log('清空云端全部文件（抹掉旧的大文件）…');
-      var del = { files: {} };
-      del.files['archive-sync.json'] = null;
-      for (var i = 1; i <= SHARD_MAX_PARTS + 8; i++) del.files['arc-part-' + i + '.json'] = null;
+    /* 第 3 步：清空云端全部文件（这是根治的关键 —— 把旧的大文件彻底抹掉）
+     *
+     * 【必须分两步，不能一次性全删】
+     * 一次性把所有文件都设成 null，等于要把 Gist 删成「一个文件都没有」，
+     * 而 GitHub 明确要求 Gist 不能为空 —— 于是直接 422 拒绝，
+     * 表现为「重建失败：清空失败（HTTP 422）」，旧的大文件一个都没清掉，
+     * 用户只能原地打转：截断还在、重建又过不去。
+     *
+     * 正确做法：
+     *   第一步：把所有文件的内容**替换**成极小占位（Gist 始终非空）→ 大文件被抹掉
+     *   第二步：再把多余的分片文件删掉，只留 archive-sync.json
+     * 这样每一步 Gist 都至少有一个文件，不会触发 422。 */
+    function patch(rid, bodyObj) {
       return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
-        method: 'PATCH', headers: h, body: JSON.stringify(del)
+        method: 'PATCH', headers: h, body: JSON.stringify(bodyObj)
       }).then(function (r) {
-        if (!r.ok) throw new Error('清空失败（HTTP ' + r.status + '）');
-        log('✓ 云端已清空');
+        if (r.ok) return true;
+        /* 出错时一定要把 GitHub 的原话带上，否则只有一个状态码，
+         * 用户（和我）都只能靠猜。 */
+        return r.text().then(function (t) {
+          var msg = '';
+          try { msg = (JSON.parse(t) || {}).message || ''; } catch (e) { msg = String(t).slice(0, 120); }
+          throw new Error('HTTP ' + r.status + (msg ? '：' + msg : ''));
+        });
+      });
+    }
+
+    function wipe(rid) {
+      log('清空云端旧文件（把超大的残留文件抹掉）…');
+      /* 第一步：全部替换成极小占位 —— Gist 始终非空，不会 422 */
+      var shrink = { files: {} };
+      shrink.files['archive-sync.json'] = { content: '{}' };
+      for (var i = 1; i <= SHARD_MAX_PARTS + 8; i++) {
+        shrink.files['arc-part-' + i + '.json'] = { content: '{}' };
+      }
+      return patch(rid, shrink).then(function () {
+        log('✓ 旧的大文件已全部替换掉');
+        /* 第二步：删掉分片文件，只留一个索引 —— Gist 依然非空 */
+        var del = { files: {} };
+        for (var j = 1; j <= SHARD_MAX_PARTS + 8; j++) del.files['arc-part-' + j + '.json'] = null;
+        return patch(rid, del);
+      }).then(function () {
+        log('✓ 云端已清空，只剩索引文件');
         return true;
       });
     }
@@ -7606,10 +7638,7 @@ var ALIGN = {
       var chain = Promise.resolve();
       plan.forEach(function (st, i) {
         chain = chain.then(function () {
-          return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
-            method: 'PATCH', headers: h, body: JSON.stringify({ files: st.files })
-          }).then(function (r) {
-            if (!r.ok) throw new Error('写入分片失败（HTTP ' + r.status + '）');
+          return patch(rid, { files: st.files }).then(function () {
             log('✓ 已写入第 ' + (i + 1) + '/' + plan.length + ' 批');
           });
         });
@@ -7617,10 +7646,7 @@ var ALIGN = {
       if (idx) {
         chain = chain.then(function () {
           var f = {}; f['archive-sync.json'] = { content: idx };
-          return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
-            method: 'PATCH', headers: h, body: JSON.stringify({ files: f })
-          }).then(function (r) {
-            if (!r.ok) throw new Error('写入索引失败（HTTP ' + r.status + '）');
+          return patch(rid, { files: f }).then(function () {
             log('✓ 已写入索引（共 ' + names.length + ' 片）');
           });
         });
@@ -7717,7 +7743,23 @@ var ALIGN = {
         '<b>404</b> → 空间不存在，或令牌属于另一个账号（私有 Gist 只有创建者能看到）。<br>' +
         '<b>401</b> → 令牌无效或过期。<br>' +
         '<b>403</b> → 额度用尽，或令牌没勾 gist 权限。<br>' +
-        '<b>413</b> → 请求体超 1 MB 被拒（已在最新版修复）。</p>';
+        '<b>413</b> → 请求体超 1 MB 被拒（已在最新版修复）。<br>' +
+        '<b>422</b> → 请求不合法。常见是「想把 Gist 删成空文件」，' +
+        'GitHub 不允许 Gist 一个文件都没有（已在最新版修复）。</p>';
+
+      /* 200 和 304 交替出现是正常的，但看起来很像出错，必须解释清楚，
+       * 否则用户会盯着这个反复怀疑。 */
+      var n200 = syncLog.filter(function (e) { return e.st === 200; }).length;
+      var n304 = syncLog.filter(function (e) { return e.st === 304; }).length;
+      if (n200 && n304) {
+        html += '<div class="sec-title" style="margin-top:14px">为什么 200 和 304 混在一起？</div>';
+        html += '<p class="hint">这是<b>正常</b>的，不是出错：<br>' +
+          '· <b>200</b> = 云端有变化，把数据拉回来了（计费）。<br>' +
+          '· <b>304</b> = 云端没变化，什么都没拉（<b>不计费</b>）。<br>' +
+          '每同步一次（写入）云端版本就变了，下一轮自然是 200；' +
+          '再往后没人改动，就一直是 304。所以两者交替出现是对的。' +
+          '真正需要看的只有「被截断」那一列。</p>';
+      }
 
       html += '<div class="sec-title" style="margin-top:14px">记录</div>';
       html += '<div style="max-height:340px;overflow:auto;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace">';
