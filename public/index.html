@@ -2760,7 +2760,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.16-b7';
+  var APP_VERSION = '2026.10.16-b8';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -7502,6 +7502,49 @@ var ALIGN = {
       return;
     }
 
+    /* 【先把令牌验一遍，再动手】
+     * 以前是闷头干完整套流程（清空 → 分批写入 → 写索引），
+     * 最后一步才撞上 401，于是云端被清了一半、写入也半途而废，
+     * 用户只看到「重建失败 HTTP 401」，既不知道是令牌的锅，
+     * 也不知道云端现在是个什么状态。
+     *
+     * 401 Bad credentials 是 GitHub 明确表示「这个令牌我不认」：
+     * 令牌输错、过期、被吊销、或复制时带了空格/换行。
+     * 这不是截断问题，也不是程序 bug —— 换一个好令牌就好。
+     *
+     * 所以重建前先花一个请求确认令牌可用（GET /user 不消耗主要额度），
+     * 不行就立刻停下，别把云端改到一半。 */
+    function preflight() {
+      log('先验证令牌是否有效…');
+      return fetch('https://api.github.com/user', { headers: h })
+        .then(function (r) {
+          if (r.ok) {
+            return r.json().then(function (d) {
+              log('✓ 令牌有效，账号：' + ((d && d.login) || '未知'));
+              return true;
+            }).catch(function () { log('✓ 令牌有效'); return true; });
+          }
+          var msg = 'Bad credentials';
+          try {
+            r.json().then(function (dd) { if (dd && dd.message) msg = dd.message; });
+          } catch (e) {}
+          if (r.status === 401) {
+            throw new Error('TOKEN_BAD:' + msg);
+          }
+          if (r.status === 403) {
+            throw new Error('GitHub 拒绝了这次验证（403），可能是额度已用尽，请稍后再试。');
+          }
+          throw new Error('令牌验证失败（HTTP ' + r.status + '）');
+        });
+    }
+
+    /* 每一步都重新取一次令牌：
+     * 万一用户在重建期间改了设置里的令牌，或旧令牌中途失效，
+     * 重新取能拿到最新的，不至于拿着一份早就不作数的凭据跑完全程。 */
+    function hdrFresh() {
+      try { return PROVIDERS.gist.hdr(); } catch (e) { return h; }
+    }
+
     /* 第 1 步：尽量救回云端数据（能读就合并，读不到也不算失败） */
     var savedRemote = null, readErr = '';
     function tryRead() {
@@ -7563,7 +7606,7 @@ var ALIGN = {
      * 这样每一步 Gist 都至少有一个文件，不会触发 422。 */
     function patch(rid, bodyObj) {
       return fetch('https://api.github.com/gists/' + encodeURIComponent(rid), {
-        method: 'PATCH', headers: h, body: JSON.stringify(bodyObj)
+        method: 'PATCH', headers: hdrFresh(), body: JSON.stringify(bodyObj)
       }).then(function (r) {
         if (r.ok) return true;
         /* 出错时一定要把 GitHub 的原话带上，否则只有一个状态码，
@@ -7596,7 +7639,7 @@ var ALIGN = {
       });
     }
 
-    tryRead().then(ensureRoom).then(function (rid) {
+    preflight().then(tryRead).then(ensureRoom).then(function (rid) {
       return wipe(rid).then(function () { return rid; });
     }).then(function (rid) {
       /* 合并数据：本机 ∪ 云端，谁新留谁 */
@@ -7697,10 +7740,38 @@ var ALIGN = {
           renderAll();
         });
     }).catch(function (e) {
-      openModal('重建失败',
-        '<p class="hint" style="color:#b91c1c">' + esc((e && e.message) ? e.message : String(e)) + '</p>' +
-        '<p class="hint">' + steps.map(function (t) { return '· ' + esc(t); }).join('<br>') + '</p>',
-        [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+      /* 401 是令牌的问题，必须给明确指引 —— 光报一个状态码，
+       * 用户根本不知道该去哪儿改。而且要说明云端现在的状态，
+       * 免得以为数据被破坏。 */
+      var msg = (e && e.message) ? String(e.message) : String(e);
+      var isToken = msg.indexOf('TOKEN_BAD') === 0;
+      var html = '';
+      if (isToken) {
+        html += '<p class="hint" style="color:#b91c1c"><b>令牌无效（401 ' +
+          esc(msg.slice(10) || 'Bad credentials') + '）</b></p>';
+        html += '<p class="hint">这是 GitHub 明确表示<b>不认这个令牌</b>。常见原因：</p>';
+        html += '<p class="hint">· 令牌<b>复制不全或带了空格/换行</b>（最常见）—— 重新复制一次<br>' +
+          '· 令牌<b>已过期</b> —— 生成时把 Expiration 选成 No expiration<br>' +
+          '· 令牌<b>被吊销</b> —— 在 GitHub 上重新生成一个<br>' +
+          '· 令牌类型选错 —— 必须是 <b>Tokens (classic)</b>，Fine-grained 不支持 Gist</p>';
+        html += '<p class="hint" style="margin-top:10px">好消息：<b>这次重建在动手之前就被拦下了，' +
+          '云端数据原封未动</b>，本机档案也一条没少。换一个有效令牌再重建即可。</p>';
+      } else {
+        html += '<p class="hint" style="color:#b91c1c">' + esc(msg) + '</p>';
+        html += '<p class="hint" style="margin-top:10px">重建是<b>先清空再重写</b>的，' +
+          '中途失败会让云端处于半成品状态 —— 但<b>本机档案一条都没少</b>。' +
+          '直接再点一次「重建云端空间」重来即可，它是可以重复执行的。</p>';
+      }
+      html += '<div class="sec-title" style="margin-top:12px">已完成的步骤</div>';
+      html += '<p class="hint">' + steps.map(function (t) { return '· ' + esc(t); }).join('<br>') + '</p>';
+
+      var btns = [{ text: '关闭', cls: 'btn ghost', fn: closeModal }];
+      if (isToken) {
+        btns.push({ text: '去设置改令牌', cls: 'btn primary', fn: function () { closeModal(); setTimeout(openSettings, 150); } });
+      } else {
+        btns.push({ text: '再试一次', cls: 'btn primary', fn: function () { closeModal(); setTimeout(doRebuild, 200); } });
+      }
+      openModal('重建失败', html, btns);
     });
   }
 
