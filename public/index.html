@@ -1269,7 +1269,10 @@ var ALIGN = {
       room: '',
       gistToken: '',
       writeMethod: 'PUT',
-      autoSync: 20,
+      /* 默认间隔从 20 秒提到 60 秒。
+       * 20 秒 × 多台设备 = 每分钟几十次请求，正是触发 GitHub
+       * 次要速率限制（滥用检测）、把额度压到 100 的直接原因。 */
+      autoSync: 60,
       deviceCount: 3,            // 同时在线的设备台数，用于估算安全同步间隔
       abnormalDays: 2,            // 超过这么多天没改状态就标异常
       abnormalExclude: '打包',     // 这些状态不参与异常提醒（逗号分隔）
@@ -1518,10 +1521,20 @@ var ALIGN = {
     return true;
   }
 
+  /* 时间戳完全打平时（相等）的确定性裁决。
+   * 原来直接取本地 a —— 于是 A、B 两台设备各取各的，
+   * 合并结果永远不一致，双方都觉得“我有独有内容要推”，
+   * 于是互相反复覆盖，谁也收敛不了（实测每 10 秒互推一次，
+   * 304 彻底消失，几分钟就把额度烧光，数据还在两个版本间来回跳）。
+   * 这里改用「内容签名」裁决：所有设备算出同一个赢家，必然收敛。 */
+  function tieBreak(a, b) {
+    return (sigOfRec(a) <= sigOfRec(b)) ? a : b;
+  }
+
   function mergePair(a, b) {
     var an = tsOf(a), bn = tsOf(b);
-    var newer = bn > an ? b : a;
-    var older = bn > an ? a : b;
+    var newer = (bn > an) ? b : ((an > bn) ? a : tieBreak(a, b));
+    var older = (newer === b) ? a : b;
     /* 【快速路径】两边内容完全一致 —— 这是同步里最常见的情况：
      * 绝大多数档案根本没被改动过，合并它们纯属浪费。
      * 原来每条都要走一次 JSON 深拷贝 + 12 个字段逐项比较 + 2~3 次 sigOfRec，
@@ -1552,8 +1565,10 @@ var ALIGN = {
     var fat = {};
     FAT_FIELDS.forEach(function (f) {
       var atA = fatOf(a, f), atB = fatOf(b, f);
-      var pick = (atB > atA) ? b : a;
-      var other = (atB > atA) ? a : b;
+      /* 字段时间戳打平时同样要确定性裁决 ——
+       * 只改这一处不够（上面 newer 已改），但两处都改才能彻底收敛。 */
+      var pick = (atB > atA) ? b : ((atA > atB) ? a : tieBreak(a, b));
+      var other = (pick === b) ? a : b;
       out[f] = (pick[f] === undefined || pick[f] === null || pick[f] === '') ? (other[f] || pick[f]) : pick[f];
       fat[f] = Math.max(atA, atB);
     });
@@ -4367,7 +4382,7 @@ var ALIGN = {
       }, sleepLeft() + 500);
       return;
     }
-    var sec = Math.max(10, parseInt(db.settings.autoSync, 10) || 20);
+    var sec = Math.max(10, parseInt(db.settings.autoSync, 10) || 60);
     // 退避期内拉长到 10 分钟一次，等配额恢复
     if (syncState.backoffUntil && syncState.backoffUntil > Date.now()) sec = 600;
     // 错峰：多台设备若同时启动，定时器会在同一秒一起发请求。
@@ -4381,7 +4396,26 @@ var ALIGN = {
     // 多台设备因为偏移不同，请求会自然错开，不会挤在同一秒。
     syncState.phaseTm = setTimeout(function () {
       syncNow(true);
-      syncState.timer = setInterval(function () { syncNow(true); }, sec * 1000);
+      syncState.timer = setInterval(function () {
+        /* 页面在后台（切到别的 App、锁屏、最小化）就彻底不发。
+         * 之前后台也照刷不误 —— 用户以为关了，其实一直在消耗额度，
+         * 这是「没怎么用额度却见底」最常见的原因。 */
+        if (document.hidden) return;
+        /* 空闲降频：没人操作时逐步拉长间隔。
+         * 开着页面挂着是最典型的浪费场景：人已经不在了，
+         * 却还在按固定频率反复问「云端变了吗」。
+         * 降频不影响实时性 —— 一旦有操作立刻恢复常速。 */
+        var idle = Date.now() - (syncState.lastUserAt || Date.now());
+        var mul = idle > 900000 ? 6 : (idle > 300000 ? 3 : (idle > 120000 ? 2 : 1));
+        syncState.idleMul = mul;
+        if (mul > 1) {
+          /* 用「计数跳过」实现降频，而不是重建定时器 ——
+           * 重建会打乱错峰偏移，多台设备又挤到一起。 */
+          syncState.skip = (syncState.skip || 0) + 1;
+          if (syncState.skip % mul !== 0) return;
+        }
+        syncNow(true);
+      }, sec * 1000);
     }, sec * 1000 + jitter);
   }
 
@@ -5294,7 +5328,9 @@ var ALIGN = {
         Object.keys(PROVIDERS).map(function (k) {
           return '<option value="' + k + '"' + (k === s.provider ? ' selected' : '') + '>' + esc(PROVIDERS[k].label) + '</option>';
         }).join('') + '</select></div>' +
-      '<div class="field"><label>自动同步间隔（秒）</label><input type="number" id="setAuto" min="10" value="' + (s.autoSync || 20) + '"></div></div>' +
+      '<div class="field"><label>自动同步间隔（秒）</label><input type="number" id="setAuto" min="10" value="' + (s.autoSync || 60) + '">' +
+        '<p class="hint">默认 60 秒。设备越多要调得越大 —— ' +
+        '请求太密会触发 GitHub 的滥用检测，把额度压到很低。</p></div></div>' +
       '<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">' +
       '<div class="field"><label>📱 档案二维码类型</label><select id="setQrMode">' +
         '<option value="auto"' + ((s.qrMode || 'auto') === 'auto' ? ' selected' : '') + '>自动（开了云同步就用简洁码 · 推荐）</option>' +
@@ -5394,7 +5430,7 @@ var ALIGN = {
         s.provider = $('#setProvider').value;
         s.room = normalizeRoom($('#setRoom').value, s.provider);
         if ($('#setToken')) s.gistToken = $('#setToken').value.trim();
-        s.autoSync = Math.max(10, parseInt($('#setAuto').value, 10) || 20);
+        s.autoSync = Math.max(10, parseInt($('#setAuto').value, 10) || 60);
         s.deviceCount = Math.max(1, parseInt($('#setDevCount').value, 10) || 3);
         s.abnormalDays = Math.max(1, parseInt($('#setAbnDays').value, 10) || 2);
         var pq = $('#setPhotoQ');
@@ -7608,9 +7644,17 @@ var ALIGN = {
     var dm = $('#drawerMask');
     if (dm && dm.addEventListener) dm.addEventListener('click', closeDrawer);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeModal(); closeDrawer(); } });
+    /* 任何真实操作都刷新「最后活跃时间」，用于空闲降频。
+     * 有动作就恢复常速同步，保证改动还是能很快传上去。 */
+    ['pointerdown', 'keydown', 'input', 'change'].forEach(function (ev) {
+      document.addEventListener(ev, function () { syncState.lastUserAt = Date.now(); syncState.skip = 0; }, true);
+    });
     window.addEventListener('hashchange', route);
     window.addEventListener('visibilitychange', function () {
       if (!document.hidden) {
+        /* 回到前台：视为有活动，立刻解除降频并同步一次。 */
+        syncState.lastUserAt = Date.now();
+        syncState.skip = 0;
         if (db.settings.syncOn && db.settings.room) syncNow(true);
       } else {
         flushOnLeave();     // 切到后台：微信里点返回、切换 App 都会走到这里
