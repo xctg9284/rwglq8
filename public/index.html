@@ -3122,7 +3122,57 @@ var ALIGN = {
         closeModal(); cleanBadPhotos();
       } });
     }
-    openModal('检查本地数据', body, btns);
+    openModal('检查本地数据', body + '<div id="hcDeep"></div>', btns);
+
+    /* 深度校验（真实解码）是异步的，放在弹窗打开之后跑，
+     * 免得图片多时卡在「正在检查」让用户干等。 */
+    var deep = document.getElementById('hcDeep');
+    if (deep && (photoStats().count > 0)) {
+      deep.innerHTML = '<p class="hint" style="color:#667085">正在逐张解码验证图片…</p>';
+      verifyPhotosDecode(function (d, t) {
+        var el = document.getElementById('hcDeep');
+        if (el) el.innerHTML = '<p class="hint" style="color:#667085">正在逐张解码验证图片… ' + d + '/' + t + '</p>';
+      }).then(function (res) {
+        var el = document.getElementById('hcDeep');
+        if (!el) return;
+        if (!res.bad.length) {
+          el.innerHTML = '<p class="hint" style="color:#0a7d33;margin-top:8px">✓ 已逐张解码验证 ' +
+            res.checked + ' 张图片，都能正常显示。</p>';
+          return;
+        }
+        el.innerHTML = '<p class="hint" style="margin-top:8px"><b style="color:#e02424">' +
+          '深度校验：有 ' + res.bad.length + ' 条档案的图片无法解码（' + res.bad.length + ' 项）</b></p>' +
+          '<div style="border-left:3px solid #e02424;padding:6px 0 6px 8px;margin:8px 0;font-size:13px;line-height:1.7">' +
+          '<b>这些图片文件本身是坏的</b><br>' +
+          '<span style="color:#667085">格式看着正常（开头也是 data:image/），但浏览器解不出来 —— ' +
+          '多半是上传时文件就损坏了，或同步传输中被截断。它们白占体积、永远显示不出来，建议删掉重新上传。</span>' +
+          '<div style="margin:6px 0 2px">' + res.bad.map(function (x) {
+            return '<div style="display:flex;align-items:center;gap:6px;padding:3px 0">' +
+              '<span style="flex:1;word-break:break-all">· 「<b>' + esc(x.name) + '</b>」' +
+              ' <span style="color:#667085">' + esc(x.note) + '</span></span>' +
+              (x.id ? '<button class="btn sm" data-loc="' + esc(x.id) + '" style="padding:2px 8px">定位</button>' : '') +
+              '</div>';
+          }).join('') + '</div></div>';
+        // 重新绑定新出现的定位按钮
+        var m2 = document.getElementById('modal');
+        if (m2) {
+          var lbs2 = m2.querySelectorAll('button[data-loc]');
+          for (var k2 = 0; k2 < lbs2.length; k2++) {
+            (function (btn) {
+              if (btn.onclick) return;
+              btn.onclick = function () {
+                var id = btn.getAttribute('data-loc');
+                closeModal();
+                setTimeout(function () { openDetail(id); }, 150);
+              };
+            })(lbs2[k2]);
+          }
+        }
+      }).catch(function () {
+        var el = document.getElementById('hcDeep');
+        if (el) el.innerHTML = '';
+      });
+    }
     /* 「定位」按钮：直接打开该档案的详情面板。
      * 只告诉名字还不够 —— 用户还得自己去列表里翻，
      * 档案一多根本找不到。这里一键打开。 */
@@ -3143,6 +3193,66 @@ var ALIGN = {
         })(lbs[k]);
       }
     }
+  }
+
+  /* 【深度校验】真实解码每一张图。
+   * 光看「开头是不是 data:image/、长度够不够」是不够的 ——
+   * 实测：把一张正常图的 base64 砍掉一大半，开头仍是 data:image/jpeg;base64，
+   * 长度也远超 100，格式检查完全通过，但它其实已经废了（传输出错、被截断）。
+   * 只有真正交给浏览器解码一次，才知道这张图到底能不能显示。
+   * 返回：{ bad: [{id,name,note}] } */
+  function verifyPhotosDecode(onProgress) {
+    var jobs = [];
+    (db.records || []).forEach(function (r) {
+      if (!r || r.demo || !r.photos || !r.photos.length) return;
+      r.photos.forEach(function (p, i) {
+        if (!p || !p.data) return;
+        var d = String(p.data);
+        if (d.indexOf('data:image/') !== 0) return;   // 这种格式检查已经报过了
+        jobs.push({ id: r.id, name: String(r.title || r.code || '(无名称)').slice(0, 24),
+                    idx: i + 1, data: d, total: r.photos.length });
+      });
+    });
+    var bad = [], done = 0;
+    if (!jobs.length) return Promise.resolve({ bad: bad, checked: 0 });
+    /* 并发 4：串行太慢（几十张图要等很久），并发太高会卡住页面。 */
+    var CONC = 4, cursor = 0;
+    function tryDecode(job) {
+      return new Promise(function (resolve) {
+        var img = new Image();
+        var t = setTimeout(function () { img.src = ''; resolve(true); }, 8000);  // 超时不判坏
+        img.onload = function () {
+          clearTimeout(t);
+          /* 能解码还不够：宽高为 0 说明内容是空的（比如只剩文件头）。 */
+          resolve(!(img.naturalWidth > 0 && img.naturalHeight > 0));
+        };
+        img.onerror = function () { clearTimeout(t); resolve(true); };
+        img.src = job.data;
+      });
+    }
+    function next() {
+      if (cursor >= jobs.length) return Promise.resolve();
+      var job = jobs[cursor++];
+      return tryDecode(job).then(function (isBad) {
+        done++;
+        if (isBad) bad.push({ id: job.id, name: job.name, note: '第 ' + job.idx + ' 张无法解码' });
+        if (onProgress) { try { onProgress(done, jobs.length); } catch (e) {} }
+        return next();
+      });
+    }
+    var runners = [];
+    for (var i = 0; i < Math.min(CONC, jobs.length); i++) runners.push(next());
+    return Promise.all(runners).then(function () {
+      // 同一条档案合并成一行显示
+      var byId = {}, out = [];
+      bad.forEach(function (x) {
+        if (!byId[x.id]) { byId[x.id] = { id: x.id, name: x.name, notes: [] }; out.push(byId[x.id]); }
+        byId[x.id].notes.push(x.note);
+      });
+      return { bad: out.map(function (x) {
+        return { id: x.id, name: x.name, note: x.notes.length + ' 张无法解码' };
+      }), checked: jobs.length };
+    });
   }
 
   /* 压缩单张图片：换数据但保留身份标记。
