@@ -2930,6 +2930,193 @@ var ALIGN = {
     return { total: total, count: count, withPhoto: withPhoto, pending: pending };
   }
 
+  /* ---------------- 本地数据体检 ----------------
+   * 「一上传就截断」多半不是云端的锅，而是本机某条档案本身就是坏的：
+   * 单条体积过大、图片数据畸形、张数超限、缺标识……这些都会让整包数据
+   * 在上传时膨胀到超限，或者解析时直接失败。
+   * 这个功能把"坏在哪一条"直接点出来，而不是让用户对着"同步失败"干瞪眼。 */
+  function healthCheck() {
+    var capBytes = SHARD_SIZE * SHARD_MAX_PARTS;
+    var issues = [];        // { level:'bad'|'warn', title, detail, fix }
+    var recs = (db.records || []).filter(function (r) { return r && !r.demo; });
+    var totalBytes = 0;
+
+    // ① 单条档案体积：这是撑爆上传的头号元凶
+    var sizes = recs.map(function (r) {
+      var b = 0;
+      try { b = byteLen(JSON.stringify(r)); } catch (e) { b = 0; }
+      totalBytes += b;
+      return { r: r, b: b };
+    }).sort(function (a, b2) { return b2.b - a.b; });
+    var bigOnes = sizes.filter(function (x) { return x.b > 300 * 1024; });
+    if (bigOnes.length) {
+      issues.push({
+        level: bigOnes[0].b > capBytes / 2 ? 'bad' : 'warn',
+        title: '有 ' + bigOnes.length + ' 条档案体积过大',
+        detail: bigOnes.slice(0, 5).map(function (x) {
+          return '· 「' + esc(String((x.r.title || x.r.code || '(无名称)')).slice(0, 20)) +
+                 '」' + fmtBytes(x.b);
+        }).join('<br>') + '<br>单条过大会直接把整包撑到上限，上传时被截断。',
+        fix: '压缩图片'
+      });
+    }
+
+    // ② 图片数据畸形 / 空项 / 张数超限
+    var badPhoto = [], emptyItem = 0, overCount = 0, noMark = 0;
+    (db.records || []).forEach(function (r) {
+      var ps = r && r.photos;
+      if (!ps || !ps.length) return;
+      var valid = 0;
+      ps.forEach(function (p) {
+        if (!p) { emptyItem++; return; }
+        if (!p.data) { emptyItem++; return; }
+        var d = String(p.data);
+        if (d.indexOf('data:image/') !== 0) { badPhoto.push(r); return; }
+        if (d.length < 100) { badPhoto.push(r); return; }   // 太短，多半是坏的
+        valid++;
+        if (!p.pid || !p.pq) noMark++;
+      });
+      if (ps.length > PHOTO_MAX_COUNT) overCount++;
+      if (valid !== ps.length && ps.length) { /* 上面已统计 */ }
+    });
+    if (badPhoto.length) {
+      issues.push({
+        level: 'bad',
+        title: '有 ' + badPhoto.length + " 处图片数据不完整",
+        detail: '这些图片的 base64 开头不是 data:image/，或内容过短。' +
+                '它们会把整包数据撑大却无法显示，解析时还可能直接失败。',
+        fix: '清理无效图片'
+      });
+    }
+    if (emptyItem) {
+      issues.push({ level: 'warn', title: '有 ' + emptyItem + ' 个空的图片占位',
+        detail: '不影响使用，但白占空间。', fix: '清理无效图片' });
+    }
+    if (overCount) {
+      issues.push({ level: 'warn', title: '有 ' + overCount + ' 条档案图片超过 ' + PHOTO_MAX_COUNT + ' 张',
+        detail: '超出部分不会被同步（程序最多保留 ' + PHOTO_MAX_COUNT + ' 张）。', fix: '清理无效图片' });
+    }
+    if (noMark) {
+      issues.push({
+        level: 'bad',
+        title: '有 ' + noMark + ' 张图片缺少身份标记',
+        detail: '这是「同步后图片越变越多」的根因：缺标记的图片在多台设备间' +
+                '会被当成不同的图反复叠加，数据滚雪球式膨胀，最后撑爆上限、同步截断。',
+        fix: '补齐标记'
+      });
+    }
+
+    // ③ 记录字段缺失 / 重复 id
+    var noId = 0, seen = {}, dupId = 0;
+    recs.forEach(function (r) {
+      if (!r.id) { noId++; return; }
+      if (seen[r.id]) dupId++; else seen[r.id] = 1;
+    });
+    if (noId) issues.push({ level: 'bad', title: '有 ' + noId + ' 条档案没有编号',
+      detail: '没有 id 的档案无法参与合并，会在同步时被反复当成新数据。', fix: null });
+    if (dupId) issues.push({ level: 'bad', title: '有 ' + dupId + ' 条档案编号重复',
+      detail: '编号相同会被当成同一条合并，可能互相覆盖。', fix: null });
+
+    // ④ 日志过多
+    if ((db.logs || []).length > 2000) {
+      issues.push({ level: 'warn', title: '变更记录有 ' + db.logs.length + ' 条',
+        detail: '日志是同步数据的大头之一，过多会让每次同步都变慢。', fix: null });
+    }
+
+    // ⑤ 总体积 vs 分片上限
+    var docBytes = 0;
+    try { docBytes = byteLen(JSON.stringify({ records: syncableRecords(), logs: db.logs, deleted: db.deleted })); } catch (e) {}
+    if (docBytes > capBytes) {
+      issues.push({ level: 'bad', title: '本机数据已超过分片上限',
+        detail: '当前 ' + fmtBytes(docBytes) + '，上限约 ' + fmtBytes(capBytes) +
+                '。超过就传不上去，或传上去别的设备读不回来（截断）。', fix: '压缩图片' });
+    } else if (docBytes > GIST_WARN_LIMIT) {
+      issues.push({ level: 'warn', title: '本机数据 ' + fmtBytes(docBytes) + '，偏大',
+        detail: '还没超限，但同步会明显变慢。建议压缩图片。', fix: '压缩图片' });
+    }
+
+    // ⑥ 本机存储
+    var storeBytes = 0;
+    try { storeBytes = byteLen(localStorage.getItem('archive_standalone_v1') || ''); } catch (e) {}
+    if (storeBytes > 4.5 * 1024 * 1024) {
+      issues.push({ level: 'bad', title: '本机存储快满了（' + fmtBytes(storeBytes) + '）',
+        detail: '浏览器上限约 5 MB。满了之后新建档案会直接失败。', fix: '压缩图片' });
+    }
+
+    return { issues: issues, docBytes: docBytes, capBytes: capBytes, storeBytes: storeBytes };
+  }
+
+  function openHealthCheck() {
+    var res = healthCheck();
+    var bad = res.issues.filter(function (x) { return x.level === 'bad'; });
+    var warn = res.issues.filter(function (x) { return x.level === 'warn'; });
+    var head = '<p class="hint">本机数据 <b>' + fmtBytes(res.docBytes) + '</b> / 上限约 ' +
+      fmtBytes(res.capBytes) + '，本机存储 ' + fmtBytes(res.storeBytes) + '。</p>';
+    var body;
+    if (!res.issues.length) {
+      body = head + '<p class="hint" style="color:#0a7d33;font-size:14px">✓ 没发现损坏或异常，本机数据是健康的。</p>';
+    } else {
+      var block = function (list, color, label) {
+        if (!list.length) return '';
+        return '<p class="hint" style="margin-top:8px"><b style="color:' + color + '">' +
+          label + '（' + list.length + ' 项）</b></p>' +
+          list.map(function (x) {
+            return '<div style="border-left:3px solid ' + color +
+              ';padding:4px 0 4px 8px;margin:6px 0;font-size:13px;line-height:1.7">' +
+              '<b>' + x.title + '</b><br>' + x.detail + '</div>';
+          }).join('');
+      };
+      body = head + block(bad, '#e02424', '需要处理') + block(warn, '#d97706', '建议关注');
+    }
+    var btns = [{ text: '关闭', cls: 'btn ghost', fn: closeModal }];
+    if (res.issues.length) {
+      btns.unshift({ text: '🗜 去压缩图片', cls: 'btn primary', fn: function () {
+        closeModal();
+        var pk = photoPresetKey();
+        askShrinkPhotos(PHOTO_PRESETS[pk] || PHOTO_PRESETS.normal, pk);
+      } });
+      btns.unshift({ text: '🧹 清理无效图片', cls: 'btn', fn: function () {
+        closeModal(); cleanBadPhotos();
+      } });
+    }
+    openModal('检查本地数据', body, btns);
+  }
+
+  /* 清理无效图片：只删"坏的"，不动任何正常图片。
+   * 包括：空项、不是 data:image/ 开头的、内容过短的、超出张数上限的。
+   * 顺带补齐缺的 pid / pq 标记（补标记不会改变画质，是安全的）。 */
+  function cleanBadPhotos() {
+    var removed = 0, fixedMark = 0, touchedRecs = 0;
+    (db.records || []).forEach(function (r) {
+      if (!r || !r.photos || !r.photos.length) return;
+      var before = r.photos.length;
+      var kept = [];
+      r.photos.forEach(function (p) {
+        if (!p || !p.data) { removed++; return; }
+        var d = String(p.data);
+        if (d.indexOf('data:image/') !== 0 || d.length < 100) { removed++; return; }
+        if (!p.pid) { p.pid = pidFromPhoto(p); fixedMark++; }
+        if (!p.pq) { p.pq = photoPresetKey(); fixedMark++; }
+        if (!p.ow || !p.oh) { p.ow = p.w || 0; p.oh = p.h || 0; }
+        kept.push(p);
+      });
+      if (kept.length > PHOTO_MAX_COUNT) {
+        removed += kept.length - PHOTO_MAX_COUNT;
+        kept = kept.slice(0, PHOTO_MAX_COUNT);
+      }
+      if (kept.length !== before) { r.photos = kept; touchedRecs++; }
+    });
+    save(); renderAll(); refreshShrinkBtn();
+    openModal('清理完成',
+      '<p class="hint" style="font-size:14px;line-height:1.8">' +
+      (removed ? '已清理 <b>' + removed + '</b> 处无效图片。<br>' : '没有发现无效图片。<br>') +
+      (fixedMark ? '已补齐 <b>' + fixedMark + '</b> 个身份标记（可避免同步时图片越变越多）。<br>' : '') +
+      '涉及 ' + touchedRecs + ' 条档案。</p>' +
+      '<p class="hint">本机数据现在 ' + fmtBytes(healthCheck().docBytes) + '。</p>',
+      [{ text: '知道了', cls: 'btn primary', fn: closeModal },
+       { text: '立即同步', cls: 'btn', fn: function () { closeModal(); syncNow(true); } }]);
+  }
+
   /* 压缩已存图片的完整流程：确认 → 进度 → 结果。
    * 抽成公共函数，顶部按钮和设置里的按钮共用同一套逻辑，
    * 避免两处各写一遍、行为不一致。 */
@@ -6526,6 +6713,7 @@ var ALIGN = {
       '<button class="btn" id="bkCsvOut">导出 CSV（Excel 可打开）</button>' +
       '<button class="btn" id="bkCsvIn">导入 CSV…</button>' +
       '<button class="btn" id="bkDedupe">🧹 检查并合并重复档案</button>' +
+      '<button class="btn primary" id="bkHealth">🩺 检查本地数据是否损坏</button>' +
       '<button class="btn danger" id="bkClear">清空本机全部数据</button>' +
       (db.settings.syncOn && db.settings.room
         ? '<button class="btn primary" id="bkDiag">🔍 同步诊断（查多设备为什么不互通）</button>' : '') +
@@ -6539,6 +6727,8 @@ var ALIGN = {
         ? '<div style="margin-top:8px"><button class="btn sm" id="bkClearDemo">清除内置的 3 条示例档案</button></div>' : '');
     openModal('备份 / 迁移', html, [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
 
+    var bh = document.getElementById('bkHealth');
+    if (bh) bh.onclick = function () { openHealthCheck(); };
     $('#bkLink').onclick = function () { closeModal(); openLink(); };
     $('#bkPaste').onclick = function () {
       // 不用 prompt：微信内置浏览器可能拦截弹窗
