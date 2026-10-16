@@ -2760,7 +2760,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.16-b5';
+  var APP_VERSION = '2026.10.16-b6';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -4187,6 +4187,24 @@ var ALIGN = {
         if (!txt) return Promise.resolve(emptyDoc());
         var idx = null;
         try { idx = JSON.parse(txt); } catch (e) { idx = null; }
+
+        /* 【必须记下云端真实的分片数 —— 而且要在判断模式之前就算】
+         * 之前只在上一次「写入」时记片数，那个值存在内存里，页面一刷新就
+         * 归零，于是下次写入以为「云端没有旧分片」，旧片永远留在 Gist 里。
+         *
+         * 更坑的是：如果云端残留的是【旧版写的超大单文件索引】，
+         * 就会走下面的单文件分支，如果在这个分支里才统计，就统计不到 ——
+         * 那些残留的 part-4/5/6 是旧版留下的大文件，清不掉，
+         * 每次体检都报「数据被截断」，而且怎么同步都好不了。
+         *
+         * 所以放到模式判断之前，两种模式都能拿到云端真实的最大片号。 */
+        var remoteMax = 0;
+        Object.keys(d.files || {}).forEach(function (n) {
+          var m = /^arc-part-(\d+)\.json$/.exec(n);
+          if (m) remoteMax = Math.max(remoteMax, parseInt(m[1], 10));
+        });
+        if (remoteMax) syncState.lastShardCount = remoteMax;
+
         // 单文件模式
         if (!idx || !idx.sharded || !idx.parts || !idx.parts.length) {
           /* 单文件且被截断（超过 1 MB）。
@@ -4205,17 +4223,6 @@ var ALIGN = {
         }
         /* 读到了分片索引：说明云端是新版写的，正常。 */
         syncState.sawSharded = true;
-        /* 【必须记下云端真实的片数】
-         * 之前只在上一次「写入」时记片数，那个值存在内存里 ——
-         * 页面一刷新就归零，于是下次写入时以为「云端没有旧分片」，
-         * 数据变小后旧片就永远留在 Gist 里，越堆越多。
-         * 这里按云端实际存在的 arc-part-N.json 推算最大编号，
-         * 不管有没有刷新过、也不管是哪台设备写的，都能清干净。 */
-        var remoteMax = 0;
-        Object.keys(d.files || {}).forEach(function (n) {
-          var m = /^arc-part-(\d+)\.json$/.exec(n);
-          if (m) remoteMax = Math.max(remoteMax, parseInt(m[1], 10));
-        });
         syncState.lastShardCount = Math.max(remoteMax, idx.parts.length);
         // 分片模式：按顺序把所有片拼起来
         var names = idx.parts;
@@ -4382,19 +4389,48 @@ var ALIGN = {
         /* 逐个 PATCH 串行执行。
          * 必须串行：并发写同一个 Gist 会互相踩，而且 If-Match 的 ETag
          * 每次写完后都会变，并行发出去必然撞 412。 */
-        function patchOne(step) {
+        function patchOne(step, i) {
+          /* 【关键】If-Match 只能用在**第一个** PATCH 上。
+           *
+           * 这里曾经有个隐蔽但致命的 bug：所有 PATCH 共用同一个 h，
+           * 而 If-Match 里的 ETag 是「写入之前」那个旧值。
+           * 第一个 PATCH 成功后，云端版本变了、ETag 也就变了 ——
+           * 第二个 PATCH 还拿着旧 ETag 去 If-Match，GitHub 判定
+           * 「云端已被改过」→ 直接 412 → 整条写入链从这一环断掉。
+           *
+           * 表现极其迷惑：前面几片写进去了，后面的片和**索引**都没写上。
+           * 索引没更新 → 还指向上一版那套分片 → 云端残留着旧的大文件
+           * （part-4/5/6 和旧的单文件索引）→ 用户看到「又截断了」，
+           * 而且每次截断的片号还不一样，像是随机出错。
+           *
+           * 正确做法：并发保护只需要在第一次写入时校验一次 ——
+           * 那之后云端就是被我们改的了，ETag 归我们，后续 PATCH 不该再带。
+           * 带了不但没意义，还会把一次正常的批量写入搞成 412。 */
+          var hh = h;
+          if (i > 0 && h['If-Match']) {
+            hh = {};
+            Object.keys(h).forEach(function (k) { hh[k] = h[k]; });
+            delete hh['If-Match'];
+          }
           return fetch('https://api.github.com/gists/' + encodeURIComponent(room), {
-            method: 'PATCH', headers: h, body: JSON.stringify({ files: step.files })
+            method: 'PATCH', headers: hh, body: JSON.stringify({ files: step.files })
           }).then(function (r) {
             self.noteQuota(r);
             if (r.status === 412) {
-              // 云端被改过：抛一个可识别的错误，交给 syncNow 重新合并后重试
+              /* 只有第一个 PATCH 的 412 才代表「云端被别的设备改了」，
+               * 需要重新合并后重试（syncNow 会处理 CONFLICT_412）。
+               * 后续 PATCH 已经不带 If-Match，理论上不会 412；
+               * 万一中途真被插队，重试这一步即可，不必整批重来 ——
+               * 否则会陷入「整批重试又撞 412」的死循环。 */
+              if (i > 0) {
+                return patchOne(step, i);
+              }
               throw new Error('CONFLICT_412');
             }
             /* 400 多半是这个 If-Match 头不被接受（弱 ETag / 格式问题）。
              * 自动去掉它重试一次，避免用户被这个头永久卡死 ——
              * 并发保护只是锦上添花，不该让同步彻底用不了。 */
-            if (r.status === 400 && usedIfMatch) {
+            if (r.status === 400 && usedIfMatch && i === 0) {
               self._noIfMatch = true;   // 记住，之后不再带
               return self.write(room, payload, true);
             }
@@ -4411,8 +4447,8 @@ var ALIGN = {
         }
 
         var chain = Promise.resolve(true);
-        steps.forEach(function (st) {
-          chain = chain.then(function () { return patchOne(st); });
+        steps.forEach(function (st, i) {
+          chain = chain.then(function () { return patchOne(st, i); });
         });
         return chain.then(function () {
           /* 写入成功后云端条数就是刚推上去的这些。
@@ -7833,6 +7869,19 @@ var ALIGN = {
         ';color:' + (ok ? '#0a7f3f' : '#b91c1c') + ';font-size:14px">' + verdict + '</div>';
 
       /* 用户最困惑的点，必须就地解释清楚 */
+      /* 真的检出截断时，光解释没用 —— 得给出能一键解决的办法。
+       * 云端残留的旧大文件不会自己消失，后续同步只会反复踩同一个坑，
+       * 唯一的根治手段是「重建云端空间」（强制覆盖，不读旧数据）。 */
+      if (!ok) {
+        html += '<div class="sec-title" style="margin-top:14px">怎么办</div>';
+        html += '<p class="hint">云端现在有被截断的大文件，<b>普通同步修不好它</b> —— ' +
+          '每次读都会命中截断，写进去的好分片也会被一票否决。' +
+          '必须<b>重建云端空间</b>：清空云端所有文件，用本机数据重新分片写入。' +
+          '重建前会自动尝试读取并合并，别的设备传上去的数据不会丢。</p>';
+        html += '<div style="margin-top:8px"><button class="btn primary" id="ciRebuild">🚑 重建云端空间（根治）</button>' +
+          ' <button class="btn sm" id="ciExport">先导出备份</button></div>';
+      }
+
       html += '<div class="sec-title" style="margin-top:14px">为什么网页上还写着「已截断」？</div>';
       html += '<p class="hint">那句话是 <b>GitHub 网页</b>的显示限制，跟数据是否完整<b>无关</b>。' +
         'GitHub 官方支持确认：网页预览对较大的文件只渲染前面一部分（约几百 KB，且这个阈值他们调低过），' +
@@ -7850,6 +7899,10 @@ var ALIGN = {
          { text: '重新检查', cls: 'btn primary', fn: function () { closeModal(); setTimeout(openCloudIntegrity, 150); } }]);
       var b = document.getElementById('ciRaw');
       if (b) b.onclick = function () { window.open('https://gist.github.com/' + encodeURIComponent(String(db.settings.room)), '_blank'); };
+      var rb = document.getElementById('ciRebuild');
+      if (rb) rb.onclick = function () { closeModal(); setTimeout(openRebuild, 200); };
+      var ex = document.getElementById('ciExport');
+      if (ex) ex.onclick = function () { closeModal(); setTimeout(openBackup, 200); };
     }).catch(function (e) {
       openModal('云端数据完整性',
         '<p class="hint" style="color:#b91c1c">' + esc(e && e.message ? e.message : String(e)) + '</p>',
