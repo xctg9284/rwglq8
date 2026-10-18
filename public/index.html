@@ -7,6 +7,11 @@
 <title>档案管理系统</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🗂️</text></svg>">
 <style>
+.row-fresh { animation: rowFresh 900ms ease-out; }
+@keyframes rowFresh {
+  from { background: #dcfce7; }
+  to   { background: transparent; }
+}
 :root {
   --bg: #f5f7fb;
   --panel: #ffffff;
@@ -2760,7 +2765,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.16-b9';
+  var APP_VERSION = '2026.10.16-b11';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -4805,6 +4810,12 @@ var ALIGN = {
         }
         if (keepToken && !String(db.settings.gistToken || '').trim()) db.settings.gistToken = keepToken;
         if (keepRoom && !String(db.settings.room || '').trim()) db.settings.room = keepRoom;
+        /* 合并前先记下每条档案的内容指纹，用来挑出「哪些真的变了」。
+         * 只有变化的才需要排队逐条显示，没变化的一直留在屏幕上。 */
+        var prevFps = Object.create(null);
+        db.records.forEach(function (r) {
+          if (r && r.id) { try { prevFps[r.id] = recFp(r); } catch (e) {} }
+        });
         var merged = mergeDocs(doc(), rem);
         /* 示例档案不参与云端交互，但不能因为同步就从本机消失——
          * 否则用户刚打开页面、还没同步完，列表里的示例就凭空没了，
@@ -4815,6 +4826,9 @@ var ALIGN = {
         db.logs = merged.logs;
         db.deleted = merged.deleted;
         save();
+        /* 数据到这里已经是最终状态，后面只是决定「什么时候让用户看见」。
+         * startReveal 会把有变化的档案按扫码优先、创建时间旧→新逐条放出来。 */
+        startReveal(prevFps);
         syncState.pendingRemoteSettings = remoteSetChanged;
         // 内容没变化就不写：省掉一半请求（read+write → 只 read），
         // 既减少额度消耗，也降低触发 GitHub 次要速率限制的概率
@@ -5263,17 +5277,107 @@ var ALIGN = {
     return 'badge s' + (i < 0 ? 0 : i % 6);
   }
 
+  /* ---------------- 渐进显示：同步后一条条冒出来 ----------------
+   * 原来的做法：合并完一大包数据，最后一次性 renderAll ——
+   * 用户盯着空白列表等好几秒，然后「唰」地全部出现，体验很差，
+   * 数据量越大越明显（很久没打开的设备要等 10 秒）。
+   *
+   * 现在改成：先算出「本次真正有变化」的档案，按
+   *   ① 扫码进来的那条（如果有变化）—— 用户最关心的就是它，先看
+   *   ② 其余按创建时间从旧到新
+   * 排队，每帧放出一批并立刻重画 —— 一条条更新上来，看得见过程。
+   * 没变化的档案不排队、一开始就在屏幕上，不会闪一下再出现。
+   *
+   * 【关键】这里只控制「显示」：db.records 在合并那一刻已是最终完整状态，
+   * 所以同步后续的回推判断、指纹比较等逻辑完全不受影响，数据不会错。 */
+  var REVEAL = { on: false, hide: null, fresh: null, timer: 0 };
+  var SCAN_ID = '';          // 扫码打开的那条档案 id（route() 里设置）
+
+  /* 用「还没放出来的 id 集合」而不是「已显示的集合」来过滤。
+   * 反过来写会有个坑：动画期间用户自己新建的档案不在已显示名单里，
+   * 于是刚建完就凭空看不见了。用隐藏名单就没这问题 ——
+   * 队列之外的记录（包括新建的）一律正常显示。 */
+  function visibleRecords() {
+    if (!REVEAL.on || !REVEAL.hide) return db.records;
+    var hide = REVEAL.hide;
+    return db.records.filter(function (r) { return r.demo || !hide[r.id]; });
+  }
+
+  function revealReset() {
+    REVEAL.on = false; REVEAL.hide = null; REVEAL.fresh = null;
+    if (REVEAL.timer) { clearTimeout(REVEAL.timer); REVEAL.timer = 0; }
+  }
+
+  /* prevFps：同步前每条档案的内容指纹，用来挑出「哪些真的变了」 */
+  function startReveal(prevFps) {
+    revealReset();
+    var all = db.records, changed = [], i;
+    for (i = 0; i < all.length; i++) {
+      var r = all[i];
+      if (!r || r.demo) continue;
+      var before = prevFps ? prevFps[r.id] : undefined;
+      if (before === undefined || before !== recFp(r)) changed.push(r);
+    }
+    if (!changed.length) return false;      // 一条都没变：不用动画，也不必重画
+
+    var pri = (SCAN_ID && db.records.some(function (r) { return r.id === SCAN_ID; })) ? SCAN_ID : '';
+    changed.sort(function (a, b) {
+      var pa = (pri && a.id === pri) ? 0 : 1;
+      var pb = (pri && b.id === pri) ? 0 : 1;
+      if (pa !== pb) return pa - pb;                 // 扫码的那条排最前
+      var x = String(a.createdAt || a.updatedAt || '');
+      var y = String(b.createdAt || b.updatedAt || '');
+      if (x !== y) return x < y ? -1 : 1;            // 创建时间：旧 → 新
+      return String(a.code || '') < String(b.code || '') ? -1 : 1;
+    });
+
+    var hide = Object.create(null);
+    changed.forEach(function (r) { hide[r.id] = 1; });
+    REVEAL.hide = hide; REVEAL.on = true;
+
+    // 每批条数：约 1 秒放完，最少每批 1 条 —— 条数少时能清楚看到一条条冒出来
+    var batch = Math.max(1, Math.ceil(changed.length / 60));
+    var idx = 0;
+    function step() {
+      try {
+        /* 页面切到后台就别做动画了：一次性显示完。
+         * 否则回来时可能还停在半成品状态，看着像数据丢了。 */
+        if (document.hidden) {
+          changed.forEach(function (r) { delete hide[r.id]; });
+          revealReset(); renderAll(); renderQuota(); return;
+        }
+        var n = 0, fresh = Object.create(null);
+        while (idx < changed.length && n < batch) {
+          delete hide[changed[idx].id]; fresh[changed[idx].id] = 1; idx++; n++;
+        }
+        REVEAL.fresh = fresh;      // 只高亮这一批，下一批就恢复常态
+        renderAll();
+        /* 顶部顺带显示进度，用户知道在更新第几条、还剩多少 */
+        renderSyncing('更新档案 ' + idx + '/' + changed.length);
+        if (idx < changed.length) REVEAL.timer = setTimeout(step, 16);
+        else { revealReset(); renderAll(); renderQuota(); }   // 恢复额度显示
+      } catch (e) {
+        /* 动画出任何岔子都必须恢复完整显示 ——
+         * 宁可没有动画，也不能让列表永远缺一块。 */
+        revealReset(); renderAll(); renderQuota();
+      }
+    }
+    step();
+    return true;
+  }
+
   function renderStats() {
+    var recs = visibleRecords();
     var byStatus = {};
-    db.records.forEach(function (r) { byStatus[r.status || '未分类'] = (byStatus[r.status || '未分类'] || 0) + 1; });
+    recs.forEach(function (r) { byStatus[r.status || '未分类'] = (byStatus[r.status || '未分类'] || 0) + 1; });
     var today = nowStr().slice(0, 10);
     var todayChanges = db.logs.filter(function (l) { return String(l.at).slice(0, 10) === today; }).length;
-    var overdue = db.records.filter(function (r) {
+    var overdue = recs.filter(function (r) {
       return r.dueDate && !finalsOf(r.status) && r.dueDate < today;
     }).length;
     var abnormal = abnormalList().length;
     var html = [
-      { n: db.records.length, t: '档案总数' },
+      { n: recs.length, t: '档案总数' },
       { n: db.logs.length, t: '状态变更' },
       { n: todayChanges, t: '今日变更' },
       { n: overdue, t: '逾期未处理' }
@@ -5321,7 +5425,7 @@ var ALIGN = {
   }
 
   function renderList() {
-    var pool = ui.abnormal ? abnormalList() : db.records;
+    var pool = ui.abnormal ? abnormalList() : visibleRecords();
     var list = sortRecords(applyFilter(pool, {
       keyword: ui.keyword, status: ui.status, category: ui.category, level: ui.level
     }), ui.sort);
@@ -5329,7 +5433,11 @@ var ALIGN = {
       var todayStr = nowStr().slice(0, 10);
     var overdue = r.dueDate && !finalsOf(r.status) && r.dueDate < todayStr;
       var abn = isAbnormal(r);
-      return '<tr data-id="' + esc(r.id) + '"' + (abn ? ' class="row-alert"' : '') + '>' +
+      /* 本次同步刚更新上来的行加个淡入高亮，让「一条条更新」看得见 */
+      var cls = [];
+      if (abn) cls.push('row-alert');
+      if (REVEAL.on && REVEAL.fresh && REVEAL.fresh[r.id]) cls.push('row-fresh');
+      return '<tr data-id="' + esc(r.id) + '"' + (cls.length ? ' class="' + cls.join(' ') + '"' : '') + '>' +
         '<td data-label="编号"><span class="code">' + esc(r.code) + '</span></td>' +
         '<td data-label="名称"><div class="t-title">' + esc(r.title) +
           (abn ? ' <span class="badge alert" title="超过 ' + abnormalDays() + ' 天没更新状态">⚠ 停滞 ' + staleDays(r) + ' 天</span>' : '') +
@@ -8933,6 +9041,8 @@ var ALIGN = {
 
   function route() {
     var h = parseHash(location.hash);
+    /* 记住扫码进来的那条档案：同步时它会排在最前面优先显示 */
+    SCAN_ID = h.id || '';
 
     // 扫码打开单条档案（链接里自带这条档案的数据，换台手机也能开）
     if (h.one) {
